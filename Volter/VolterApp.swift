@@ -26,9 +26,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Disable the Dock icon
         NSApp.setActivationPolicy(.accessory)
 
-        // Setup popover window
+        // Setup popover window (Matching ContentView’s 114pt height constraint)
         let popover = NSPopover()
-        popover.contentSize = NSSize(width: 290, height: 125)
+        popover.contentSize = NSSize(width: 290, height: 114)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: ContentView())
         self.popover = popover

@@ -34,9 +34,9 @@ struct ContentView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
+        ZStack(alignment: .topLeading) {
             
-            // Header Row: Statically positioned and locked vertically to eliminate Y shifts
+            // 1. Static Header Row: Explicitly sized to 290px to lock all elements in place
             HStack(alignment: .center) {
                 // Left Title / Checkbox (Cross-fade transition)
                 ZStack(alignment: .leading) {
@@ -54,7 +54,7 @@ struct ContentView: View {
                 
                 Spacer()
 
-                // Right static alignment container (Keeps the check button perfectly static)
+                // Right static alignment container (Anchored to prevent shifting)
                 HStack(spacing: 8) {
                     if !showingSettings {
                         // Settings Button (slides out cleanly)
@@ -97,30 +97,28 @@ struct ContentView: View {
                 }
             }
             .padding(.horizontal, 16)
+            .frame(width: 290, height: 24)
             .padding(.top, 12)
-            .frame(height: 24)
             
-            Spacer(minLength: 12)
-
-            // Dynamic Body Container: Horizontal slide mechanism (No rubber band bounce)
+            // 2. Sliding Body Container (Centered vertically within the remaining frame)
             HStack(spacing: 0) {
                 mainBody
-                    .frame(width: 290, height: 77)
-                    .padding(.horizontal, 16)
+                    .frame(width: 290, height: 64)
                 
                 settingsBody
-                    .frame(width: 290, height: 77)
-                    .padding(.horizontal, 16)
+                    .frame(width: 290, height: 64)
             }
-            .frame(width: 580, height: 77, alignment: .leading)
+            .frame(width: 580, height: 64, alignment: .leading)
             .offset(x: showingSettings ? -290 : 0)
+            .offset(y: 38)
         }
-        .frame(width: 290, height: 125, alignment: .topLeading)
+        .frame(width: 290, height: 114, alignment: .topLeading) // Overall height reduced to 114pt
+        .clipped() // Prevents sliding views from rendering outside the window boundaries
     }
 
     // MARK: - Main Panel View
     private var mainBody: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 8) {
             // Row 2: Low Power Mode
             HStack(alignment: .center) {
                 Text("Low Power Mode:")
@@ -174,6 +172,7 @@ struct ContentView: View {
             }
             .frame(height: 22)
         }
+        .padding(.horizontal, 16)
     }
 
     // MARK: - Settings Panel View
@@ -193,6 +192,7 @@ struct ContentView: View {
             .buttonStyle(.plain)
             Spacer()
         }
+        .padding(.horizontal, 16)
     }
 }
 
@@ -210,28 +210,28 @@ struct PointingUpThumbShape: Shape {
     }
 }
 
-// MARK: - Modernized Custom Tick Slider
+// MARK: - Custom Tick Slider
 struct CustomTickSlider: View {
     @Binding var value: Double
     let range: ClosedRange<Double>
-    let tickCount: Int = 25 // 0 to 24 inclusive
+    let tickCount: Int = 25
 
     var body: some View {
         GeometryReader { geometry in
             let width = geometry.size.width
-            let thumbWidth: CGFloat = 12
+            let thumbWidth: CGFloat = 11
             let usableWidth = width - thumbWidth
             
             let percentage = CGFloat((value - range.lowerBound) / (range.upperBound - range.lowerBound))
             let thumbX = percentage * usableWidth + (thumbWidth / 2)
             
             ZStack {
-                // 1. Ticks: Modern, crisp design
+                // Ticks: Styled to align directly with track spacing
                 HStack(spacing: 0) {
                     ForEach(0..<tickCount, id: \.self) { i in
                         Rectangle()
                             .fill(Color.secondary.opacity(0.25))
-                            .frame(width: 1, height: 6)
+                            .frame(width: 1, height: 5)
                         if i < (tickCount - 1) {
                             Spacer(minLength: 0)
                         }
@@ -240,22 +240,22 @@ struct CustomTickSlider: View {
                 .padding(.horizontal, thumbWidth / 2)
                 .offset(y: -7)
                 
-                // 2. Track: Robust modern rounded capsule (3pt height)
-                RoundedRectangle(cornerRadius: 1.5)
-                    .fill(Color.gray.opacity(0.25))
-                    .frame(height: 3)
+                // Track: Sleek 2pt height segment
+                Rectangle()
+                    .fill(Color.gray.opacity(0.3))
+                    .frame(height: 2)
                     .padding(.horizontal, thumbWidth / 2)
                 
-                // 3. Thumb: Pentagon shape pointing up
+                // Thumb: Sharp, pointing-up pentagonal arrow
                 PointingUpThumbShape()
                     .fill(Color.white)
                     .overlay(
                         PointingUpThumbShape()
                             .stroke(Color.gray.opacity(0.55), lineWidth: 1)
                     )
-                    .frame(width: thumbWidth, height: 13)
-                    .shadow(color: Color.black.opacity(0.18), radius: 1.5, x: 0, y: 1)
-                    .offset(x: thumbX - (width / 2), y: 2.5)
+                    .frame(width: thumbWidth, height: 11)
+                    .shadow(color: Color.black.opacity(0.12), radius: 1, x: 0, y: 1)
+                    .offset(x: thumbX - (width / 2), y: 3.5)
             }
             .frame(width: width, height: geometry.size.height)
             .contentShape(Rectangle())
@@ -267,7 +267,6 @@ struct CustomTickSlider: View {
                         let newPercent = clampedX / usableWidth
                         let calculatedValue = Double(newPercent) * (range.upperBound - range.lowerBound) + range.lowerBound
                         
-                        // Enforce integer increments (stepping at each watt)
                         value = round(calculatedValue)
                     }
             )
