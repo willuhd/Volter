@@ -56,14 +56,24 @@ struct ContentView: View {
                 // Right static alignment container (Anchored to prevent shifting)
                 HStack(spacing: 8) {
                     if !showingSettings {
-                        // Settings Button (slides out cleanly)
+                        // Settings Button: morphs to an "X" to discard changes when modifications exist
                         Button(action: {
-                            withAnimation(.easeInOut(duration: 0.25)) {
-                                showingSettings = true
+                            if hasChanges {
+                                // Discard pending changes and revert to baseline
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    turbo = baseTurbo
+                                    lowPowerMode = baseLowPowerMode
+                                    powerLimit = basePowerLimit
+                                }
+                            } else {
+                                // Enter settings panel
+                                withAnimation(.easeInOut(duration: 0.25)) {
+                                    showingSettings = true
+                                }
                             }
                         }) {
-                            Image(systemName: "gearshape.fill")
-                                .font(.system(size: 11))
+                            Image(systemName: hasChanges ? "xmark" : "gearshape.fill")
+                                .font(.system(size: hasChanges ? 9 : 11, weight: hasChanges ? .bold : .regular))
                                 .foregroundColor(.primary)
                                 .frame(width: 20, height: 20)
                                 .background(Color(NSColor.controlColor))
@@ -158,13 +168,13 @@ struct ContentView: View {
                     set: { powerLimit = $0 }
                 ), range: 0...43)
                 
-                // Static Readout Label (Drag-to-adjust removed)
+                // Static Readout Label
                 Text(Int(powerLimit) == 0 ? "Off" : "\(Int(powerLimit))W")
                     .font(.body)
                     .multilineTextAlignment(.trailing)
                     .frame(width: 45, height: 20, alignment: .trailing)
             }
-            .frame(height: 22)
+            .frame(height: 24)
         }
         .padding(.horizontal, 16)
     }
@@ -268,6 +278,8 @@ struct CustomTickSlider: View {
     let range: ClosedRange<Double>
     let physicalMax: Double = 24.0 // Visually maxes out at 24W
     let tickCount: Int = 25        // 0 to 24 visual markers
+    
+    @State private var isDragging: Bool = false // Tracks active selection state
 
     var body: some View {
         GeometryReader { geometry in
@@ -293,24 +305,29 @@ struct CustomTickSlider: View {
                     }
                 }
                 .frame(width: usableWidth)
-                .offset(x: thumbWidth / 2, y: -6)
+                .offset(x: thumbWidth / 2, y: -3)
                 
                 // 2. The Non-Blue Slider Bar (Solid grey track directly below indicators)
                 Capsule()
                     .fill(Color(NSColor.separatorColor).opacity(0.75))
                     .frame(width: usableWidth, height: 3)
-                    .offset(x: thumbWidth / 2, y: 3)
+                    .offset(x: thumbWidth / 2, y: 7)
                 
-                // 3. The Pentagon Thumb (Situated on the track, tip points up to the ticks)
+                // 3. The Pentagon Thumb (Overlaps track, pointing tip aligns with ticks)
                 PointingUpThumbShape()
                     .fill(Color.white)
                     .overlay(
                         PointingUpThumbShape()
-                            .stroke(Color.gray.opacity(0.42), style: StrokeStyle(lineWidth: 1, lineCap: .round, lineJoin: .round))
+                            .stroke(
+                                Color.gray.opacity(0.42),
+                                style: StrokeStyle(lineWidth: 1, lineCap: .round, lineJoin: .round)
+                            )
                     )
                     .shadow(color: Color.black.opacity(0.14), radius: 1, x: 0, y: 1)
                     .frame(width: thumbWidth, height: 14)
-                    .offset(x: thumbCenterX - (thumbWidth / 2), y: 8)
+                    // The transparency dimming is applied directly here to only affect the pentagon
+                    .opacity(isDragging ? 0.65 : 1.0)
+                    .offset(x: thumbCenterX - (thumbWidth / 2), y: 4)
             }
             // Explicitly aligned to leading boundary to match geometry coordinates perfectly
             .frame(width: width, height: geometry.size.height, alignment: .leading)
@@ -318,6 +335,8 @@ struct CustomTickSlider: View {
             .gesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { gestureValue in
+                        isDragging = true
+                        
                         let stepWidth = usableWidth / physicalMax
                         let locationX = gestureValue.location.x - (thumbWidth / 2)
                         
@@ -336,8 +355,11 @@ struct CustomTickSlider: View {
                         // Bounds clamped strictly at 43W maximum
                         value = min(max(round(calculatedValue), range.lowerBound), range.upperBound)
                     }
+                    .onEnded { _ in
+                        isDragging = false
+                    }
             )
         }
-        .frame(height: 20)
+        .frame(height: 24) // Frame height completely wraps visual range for reliable hit-testing
     }
 }
