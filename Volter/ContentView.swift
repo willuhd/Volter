@@ -22,9 +22,6 @@ struct ContentView: View {
     @State private var showingSettings = false
     @State private var isApplying = false // Tracking backend execution state
     
-    // High-resolution accumulator to prevent choppy trackpad/mouse drag interactions
-    @State private var dragPowerAccumulator: Double = 14.0
-    
     let modes = ["Off", "On", "Battery"]
     
     // Computed property to detect state divergence
@@ -149,7 +146,7 @@ struct ContentView: View {
             }
             .frame(height: 22)
             
-            // Row 3: Power Limit
+            // Row 3: Power Limit (Clamped at 43W maximum)
             HStack(alignment: .center) {
                 Text("Power Limit:")
                     .font(.body)
@@ -157,30 +154,15 @@ struct ContentView: View {
                     .fixedSize(horizontal: true, vertical: false)
                 
                 CustomTickSlider(value: Binding(
-                    get: { min(powerLimit, 24.0) },
+                    get: { min(powerLimit, 43.0) },
                     set: { powerLimit = $0 }
-                ), range: 0...24)
+                ), range: 0...43)
                 
-                // High-resolution Drag Readout Label (No white background frame)
-                ZStack {
-                    Text(Int(powerLimit) == 0 ? "Off" : "\(Int(powerLimit))W")
-                        .font(.body)
-                        .multilineTextAlignment(.trailing)
-                        .frame(width: 45, height: 20, alignment: .trailing)
-                    
-                    RelativeDragTracker(
-                        onDragStart: {
-                            dragPowerAccumulator = powerLimit
-                        },
-                        onDrag: { deltaX in
-                            // Trackpad-optimized continuous divider
-                            let newAccumulator = dragPowerAccumulator + (deltaX / 11.0)
-                            dragPowerAccumulator = min(max(newAccumulator, 0), 24)
-                            powerLimit = round(dragPowerAccumulator)
-                        }
-                    )
-                    .frame(width: 45, height: 20)
-                }
+                // Static Readout Label (Drag-to-adjust removed)
+                Text(Int(powerLimit) == 0 ? "Off" : "\(Int(powerLimit))W")
+                    .font(.body)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 45, height: 20, alignment: .trailing)
             }
             .frame(height: 22)
         }
@@ -244,15 +226,37 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Pointing-Up Pentagon Thumb Shape
+// MARK: - Pointing-Up Pentagon Thumb Shape (Rounded corner design matching image)
 struct PointingUpThumbShape: Shape {
     func path(in rect: CGRect) -> Path {
         var path = Path()
-        path.move(to: CGPoint(x: rect.minX, y: rect.maxY))
-        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
-        path.addLine(to: CGPoint(x: rect.maxX, y: rect.height * 0.45))
+        let r: CGFloat = 2.0 // Subtle rounding factor for the corners/shoulders
+        
+        // Starts drawing from the bottom-left corner with rounding
+        path.move(to: CGPoint(x: rect.minX + r, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.maxX - r, y: rect.maxY))
+        path.addQuadCurve(to: CGPoint(x: rect.maxX, y: rect.maxY - r),
+                          control: CGPoint(x: rect.maxX, y: rect.maxY))
+        
+        // Rises up the right vertical edge to the rounded shoulder
+        let shoulderY = rect.height * 0.44
+        path.addLine(to: CGPoint(x: rect.maxX, y: shoulderY + r))
+        path.addQuadCurve(to: CGPoint(x: rect.maxX - r, y: shoulderY),
+                          control: CGPoint(x: rect.maxX, y: shoulderY + r/2))
+        
+        // Converges upward to the pointing tip
         path.addLine(to: CGPoint(x: rect.midX, y: rect.minY))
-        path.addLine(to: CGPoint(x: rect.minX, y: rect.height * 0.45))
+        
+        // Descends to the left rounded shoulder
+        path.addLine(to: CGPoint(x: rect.minX + r, y: shoulderY))
+        path.addQuadCurve(to: CGPoint(x: rect.minX, y: shoulderY + r),
+                          control: CGPoint(x: rect.minX, y: shoulderY + r/2))
+        
+        // Descends the left vertical edge back down to the bottom-left corner
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY - r))
+        path.addQuadCurve(to: CGPoint(x: rect.minX + r, y: rect.maxY),
+                          control: CGPoint(x: rect.minX, y: rect.maxY))
+        
         path.closeSubpath()
         return path
     }
@@ -262,114 +266,78 @@ struct PointingUpThumbShape: Shape {
 struct CustomTickSlider: View {
     @Binding var value: Double
     let range: ClosedRange<Double>
-    let tickCount: Int = 25
+    let physicalMax: Double = 24.0 // Visually maxes out at 24W
+    let tickCount: Int = 25        // 0 to 24 visual markers
 
     var body: some View {
         GeometryReader { geometry in
             let width = geometry.size.width
-            let thumbWidth: CGFloat = 11
+            let thumbWidth: CGFloat = 14
             let usableWidth = width - thumbWidth
             
-            let percentage = CGFloat((value - range.lowerBound) / (range.upperBound - range.lowerBound))
-            let thumbX = percentage * usableWidth + (thumbWidth / 2)
+            // Constrain the visual thumb's layout alignment to 0...24 range
+            let clampedVisualValue = min(value, physicalMax)
+            let percentage = CGFloat(clampedVisualValue / physicalMax)
+            let thumbCenterX = (percentage * usableWidth) + (thumbWidth / 2)
             
-            ZStack {
-                // Ticks: Styled to align directly with track spacing
+            ZStack(alignment: .leading) {
+                // 1. Indicators (Ticks) positioned on top of the bar
                 HStack(spacing: 0) {
                     ForEach(0..<tickCount, id: \.self) { i in
                         Rectangle()
-                            .fill(Color.secondary.opacity(0.25))
+                            .fill(Color(NSColor.placeholderTextColor).opacity(0.45))
                             .frame(width: 1, height: 5)
                         if i < (tickCount - 1) {
                             Spacer(minLength: 0)
                         }
                     }
                 }
-                .padding(.horizontal, thumbWidth / 2)
-                .offset(y: -7)
+                .frame(width: usableWidth)
+                .offset(x: thumbWidth / 2, y: -6)
                 
-                // Track: Sleek 2pt height segment
-                Rectangle()
-                    .fill(Color.gray.opacity(0.3))
-                    .frame(height: 2)
-                    .padding(.horizontal, thumbWidth / 2)
+                // 2. The Non-Blue Slider Bar (Solid grey track directly below indicators)
+                Capsule()
+                    .fill(Color(NSColor.separatorColor).opacity(0.75))
+                    .frame(width: usableWidth, height: 3)
+                    .offset(x: thumbWidth / 2, y: 3)
                 
-                // Thumb: Sharp, pointing-up pentagonal arrow
+                // 3. The Pentagon Thumb (Situated on the track, tip points up to the ticks)
                 PointingUpThumbShape()
                     .fill(Color.white)
                     .overlay(
                         PointingUpThumbShape()
-                            .stroke(Color.gray.opacity(0.55), lineWidth: 1)
+                            .stroke(Color.gray.opacity(0.42), style: StrokeStyle(lineWidth: 1, lineCap: .round, lineJoin: .round))
                     )
-                    .frame(width: thumbWidth, height: 11)
-                    .shadow(color: Color.black.opacity(0.12), radius: 1, x: 0, y: 1)
-                    .offset(x: thumbX - (width / 2), y: 3.5)
+                    .shadow(color: Color.black.opacity(0.14), radius: 1, x: 0, y: 1)
+                    .frame(width: thumbWidth, height: 14)
+                    .offset(x: thumbCenterX - (thumbWidth / 2), y: 8)
             }
-            .frame(width: width, height: geometry.size.height)
+            // Explicitly aligned to leading boundary to match geometry coordinates perfectly
+            .frame(width: width, height: geometry.size.height, alignment: .leading)
             .contentShape(Rectangle())
             .gesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { gestureValue in
+                        let stepWidth = usableWidth / physicalMax
                         let locationX = gestureValue.location.x - (thumbWidth / 2)
-                        let clampedX = min(max(locationX, 0), usableWidth)
-                        let newPercent = clampedX / usableWidth
-                        let calculatedValue = Double(newPercent) * (range.upperBound - range.lowerBound) + range.lowerBound
                         
-                        value = round(calculatedValue)
+                        let calculatedValue: Double
+                        if locationX <= usableWidth {
+                            // Dragging inside visible bounds: 0...24W
+                            let rawPercent = max(0, locationX) / usableWidth
+                            calculatedValue = Double(rawPercent) * physicalMax
+                        } else {
+                            // Dragging past the right boundary: continues accumulating steps up to 43W
+                            let extraWidth = locationX - usableWidth
+                            let extraSteps = extraWidth / stepWidth
+                            calculatedValue = physicalMax + Double(extraSteps)
+                        }
+                        
+                        // Bounds clamped strictly at 43W maximum
+                        value = min(max(round(calculatedValue), range.lowerBound), range.upperBound)
                     }
             )
         }
         .frame(height: 20)
-    }
-}
-
-// MARK: - Cocoa Relative Drag Tracker
-struct RelativeDragTracker: NSViewRepresentable {
-    var onDragStart: () -> Void
-    var onDrag: (Double) -> Void
-    
-    func makeNSView(context: Context) -> MouseTrackerView {
-        let view = MouseTrackerView()
-        view.onDragStart = onDragStart
-        view.onDrag = onDrag
-        return view
-    }
-    
-    func updateNSView(_ nsView: MouseTrackerView, context: Context) {}
-}
-
-class MouseTrackerView: NSView {
-    var onDragStart: (() -> Void)?
-    var onDrag: ((Double) -> Void)?
-    private var trackingArea: NSTrackingArea?
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let existing = trackingArea {
-            removeTrackingArea(existing)
-        }
-        let options: NSTrackingArea.Options = [.mouseEnteredAndExited, .activeAlways, .cursorUpdate]
-        let newArea = NSTrackingArea(rect: bounds, options: options, owner: self, userInfo: nil)
-        addTrackingArea(newArea)
-        trackingArea = newArea
-    }
-
-    override func cursorUpdate(with event: NSEvent) {
-        NSCursor.resizeLeftRight.set()
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        onDragStart?()
-        CGAssociateMouseAndMouseCursorPosition(0)
-        NSCursor.hide()
-    }
-
-    override func mouseDragged(with event: NSEvent) {
-        onDrag?(Double(event.deltaX))
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        CGAssociateMouseAndMouseCursorPosition(1)
-        NSCursor.unhide()
     }
 }
