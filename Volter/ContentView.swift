@@ -13,26 +13,27 @@ struct ContentView: View {
     @State private var turbo = false
     @State private var lowPowerMode = "Off"
     @State private var powerLimit: Double = 14.0
-
+    
     // Baseline states to track if "something changes"
     @State private var baseTurbo = false
     @State private var baseLowPowerMode = "Off"
     @State private var basePowerLimit: Double = 14.0
-
+    
     @State private var showingSettings = false
+    @State private var isApplying = false // Tracking backend execution state
     
     // High-resolution accumulator to prevent choppy trackpad/mouse drag interactions
     @State private var dragPowerAccumulator: Double = 14.0
-
+    
     let modes = ["Off", "On", "Battery"]
-
+    
     // Computed property to detect state divergence
     var hasChanges: Bool {
         turbo != baseTurbo ||
         lowPowerMode != baseLowPowerMode ||
         Int(powerLimit) != Int(basePowerLimit)
     }
-
+    
     var body: some View {
         ZStack(alignment: .topLeading) {
             
@@ -44,6 +45,7 @@ struct ContentView: View {
                         Toggle("Turbo", isOn: $turbo)
                             .toggleStyle(.checkbox)
                             .font(.body)
+                            .disabled(isApplying)
                             .transition(.opacity)
                     } else {
                         Text("Volter")
@@ -53,7 +55,7 @@ struct ContentView: View {
                 }
                 
                 Spacer()
-
+                
                 // Right static alignment container (Anchored to prevent shifting)
                 HStack(spacing: 8) {
                     if !showingSettings {
@@ -71,9 +73,10 @@ struct ContentView: View {
                                 .clipShape(Circle())
                         }
                         .buttonStyle(.plain)
+                        .disabled(isApplying)
                         .transition(.opacity.combined(with: .move(edge: .leading)))
                     }
-
+                    
                     // Checkmark Button: Anchored firmly (never moves vertically or horizontally)
                     Button(action: {
                         if showingSettings {
@@ -81,19 +84,27 @@ struct ContentView: View {
                                 showingSettings = false
                             }
                         } else {
-                            baseTurbo = turbo
-                            baseLowPowerMode = lowPowerMode
-                            basePowerLimit = powerLimit
+                            applyChanges()
                         }
                     }) {
-                        Image(systemName: "checkmark")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundColor(showingSettings ? .secondary : (hasChanges ? .white : .secondary))
-                            .frame(width: 20, height: 20)
-                            .background(showingSettings ? Color(NSColor.controlColor) : (hasChanges ? Color.blue : Color(NSColor.controlColor)))
-                            .clipShape(Circle())
+                        ZStack {
+                            if isApplying {
+                                ProgressView()
+                                    .progressViewStyle(.circular)
+                                    .scaleEffect(0.5)
+                                    .frame(width: 20, height: 20)
+                            } else {
+                                Image(systemName: "checkmark")
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundColor(showingSettings ? .secondary : (hasChanges ? .white : .secondary))
+                                    .frame(width: 20, height: 20)
+                                    .background(showingSettings ? Color(NSColor.controlColor) : (hasChanges ? Color.blue : Color(NSColor.controlColor)))
+                                    .clipShape(Circle())
+                            }
+                        }
                     }
                     .buttonStyle(.plain)
+                    .disabled(isApplying || (!hasChanges && !showingSettings))
                 }
             }
             .padding(.horizontal, 16)
@@ -104,6 +115,7 @@ struct ContentView: View {
             HStack(spacing: 0) {
                 mainBody
                     .frame(width: 290, height: 64)
+                    .disabled(isApplying)
                 
                 settingsBody
                     .frame(width: 290, height: 64)
@@ -115,7 +127,7 @@ struct ContentView: View {
         .frame(width: 290, height: 114, alignment: .topLeading) // Overall height reduced to 114pt
         .clipped() // Prevents sliding views from rendering outside the window boundaries
     }
-
+    
     // MARK: - Main Panel View
     private var mainBody: some View {
         VStack(spacing: 8) {
@@ -136,19 +148,19 @@ struct ContentView: View {
                 .pickerStyle(.segmented)
             }
             .frame(height: 22)
-
+            
             // Row 3: Power Limit
             HStack(alignment: .center) {
                 Text("Power Limit:")
                     .font(.body)
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
-
+                
                 CustomTickSlider(value: Binding(
                     get: { min(powerLimit, 24.0) },
                     set: { powerLimit = $0 }
                 ), range: 0...24)
-
+                
                 // High-resolution Drag Readout Label (No white background frame)
                 ZStack {
                     Text(Int(powerLimit) == 0 ? "Off" : "\(Int(powerLimit))W")
@@ -163,7 +175,7 @@ struct ContentView: View {
                         onDrag: { deltaX in
                             // Trackpad-optimized continuous divider
                             let newAccumulator = dragPowerAccumulator + (deltaX / 11.0)
-                            dragPowerAccumulator = min(max(newAccumulator, 0), 45)
+                            dragPowerAccumulator = min(max(newAccumulator, 0), 24)
                             powerLimit = round(dragPowerAccumulator)
                         }
                     )
@@ -174,7 +186,7 @@ struct ContentView: View {
         }
         .padding(.horizontal, 16)
     }
-
+    
     // MARK: - Settings Panel View
     private var settingsBody: some View {
         VStack {
@@ -193,6 +205,42 @@ struct ContentView: View {
             Spacer()
         }
         .padding(.horizontal, 16)
+    }
+    
+    // MARK: - Controller Actions
+    private func applyChanges() {
+        // Prevent concurrent execution queueing
+        guard !isApplying else { return }
+        isApplying = true
+        
+        let targetTurbo = turbo
+        let targetPowerLimit = powerLimit
+        let targetLowPowerMode = lowPowerMode
+        
+        DispatchQueue.global(qos: .userInitiated).async {
+            let success = PowerManager.shared.applySettings(
+                turbo: targetTurbo,
+                powerLimit: targetPowerLimit,
+                lowPowerMode: targetLowPowerMode
+            )
+            
+            DispatchQueue.main.async {
+                isApplying = false
+                if success {
+                    // Update baseline targets on authorization success
+                    baseTurbo = targetTurbo
+                    basePowerLimit = targetPowerLimit
+                    baseLowPowerMode = targetLowPowerMode
+                } else {
+                    // Roll back working values to previous baseline because execution failed
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        turbo = baseTurbo
+                        powerLimit = basePowerLimit
+                        lowPowerMode = baseLowPowerMode
+                    }
+                }
+            }
+        }
     }
 }
 
