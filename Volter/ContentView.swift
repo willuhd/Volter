@@ -14,7 +14,7 @@ struct ContentView: View {
     @State private var lowPowerMode = "Off"
     @State private var powerLimit: Double = 14.0
     
-    // Baseline states to track if "something changes"
+    // Baseline states to track rollback targets
     @State private var baseTurbo = false
     @State private var baseLowPowerMode = "Off"
     @State private var basePowerLimit: Double = 14.0
@@ -23,13 +23,6 @@ struct ContentView: View {
     @State private var isApplying = false // Tracking backend execution state
     
     let modes = ["Off", "On", "Battery"]
-    
-    // Computed property to detect state divergence
-    var hasChanges: Bool {
-        turbo != baseTurbo ||
-        lowPowerMode != baseLowPowerMode ||
-        Int(powerLimit) != Int(basePowerLimit)
-    }
     
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -56,24 +49,14 @@ struct ContentView: View {
                 // Right static alignment container (Anchored to prevent shifting)
                 HStack(spacing: 8) {
                     if !showingSettings {
-                        // Settings Button: morphs to an "X" to discard changes when modifications exist
+                        // Settings Button: Enters settings panel
                         Button(action: {
-                            if hasChanges {
-                                // Discard pending changes and revert to baseline
-                                withAnimation(.easeInOut(duration: 0.2)) {
-                                    turbo = baseTurbo
-                                    lowPowerMode = baseLowPowerMode
-                                    powerLimit = basePowerLimit
-                                }
-                            } else {
-                                // Enter settings panel
-                                withAnimation(.easeInOut(duration: 0.25)) {
-                                    showingSettings = true
-                                }
+                            withAnimation(.easeInOut(duration: 0.25)) {
+                                showingSettings = true
                             }
                         }) {
-                            Image(systemName: hasChanges ? "xmark" : "gearshape.fill")
-                                .font(.system(size: hasChanges ? 9 : 11, weight: hasChanges ? .bold : .regular))
+                            Image(systemName: "gearshape.fill")
+                                .font(.system(size: 11, weight: .regular))
                                 .foregroundColor(.primary)
                                 .frame(width: 20, height: 20)
                                 .background(Color(NSColor.controlColor))
@@ -103,15 +86,15 @@ struct ContentView: View {
                             } else {
                                 Image(systemName: "checkmark")
                                     .font(.system(size: 9, weight: .bold))
-                                    .foregroundColor(showingSettings ? .secondary : (hasChanges ? .white : .secondary))
+                                    .foregroundColor(showingSettings ? .secondary : .white)
                                     .frame(width: 20, height: 20)
-                                    .background(showingSettings ? Color(NSColor.controlColor) : (hasChanges ? Color.blue : Color(NSColor.controlColor)))
+                                    .background(showingSettings ? Color(NSColor.controlColor) : Color.blue)
                                     .clipShape(Circle())
                             }
                         }
                     }
                     .buttonStyle(.plain)
-                    .disabled(isApplying || (!hasChanges && !showingSettings))
+                    .disabled(isApplying)
                 }
             }
             .padding(.horizontal, 16)
