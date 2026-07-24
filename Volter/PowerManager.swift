@@ -41,11 +41,23 @@ class PowerManager {
         }
     }
     
+    /// Converts an RPM integer to the SMC little-endian IEEE 754 hex string.
+    private func fanSpeedToHex(_ rpm: Int) -> String {
+        let floatValue = Float(rpm)
+        let bits = floatValue.bitPattern
+        let b0 = UInt8(bits & 0xFF)
+        let b1 = UInt8((bits >> 8) & 0xFF)
+        let b2 = UInt8((bits >> 16) & 0xFF)
+        let b3 = UInt8((bits >> 24) & 0xFF)
+        return String(format: "%02x%02x%02x%02x", b0, b1, b2, b3)
+    }
+    
     /// Prepares and runs the privileged helper tasks using the native Security Framework.
-    func applySettings(turbo: Bool, powerLimit: Double, lowPowerMode: String) -> Bool {
+    func applySettings(turbo: Bool, powerLimit: Double, lowPowerMode: String, fanSpeed: Double) -> Bool {
         guard let bundledBinaryPath = Bundle.main.path(forResource: "voltageshift", ofType: nil),
-              let bundledKextPath = Bundle.main.path(forResource: "VoltageShift", ofType: "kext") else {
-            print("Error: voltageshift or VoltageShift.kext not found in app bundle.")
+              let bundledKextPath = Bundle.main.path(forResource: "VoltageShift", ofType: "kext"),
+              let bundledSmcPath = Bundle.main.path(forResource: "smc", ofType: nil) else {
+            print("Error: voltageshift, VoltageShift.kext, or smc not found in app bundle.")
             return false
         }
         
@@ -65,6 +77,7 @@ class PowerManager {
         // 4. Copy assets and assign root permissions
         commands.append("cp -Rf '\(bundledBinaryPath)' '\(secureDir)/'")
         commands.append("cp -Rf '\(bundledKextPath)' '\(secureDir)/'")
+        commands.append("cp -Rf '\(bundledSmcPath)' '\(secureDir)/'")
         commands.append("chown -R root:wheel '\(secureDir)'")
         commands.append("chmod -R 755 '\(secureDir)'")
         
@@ -83,7 +96,18 @@ class PowerManager {
             commands.append("'\(secureDir)/voltageshift' write 0x610 \(writeArg)")
         }
         
-        // 7. Apply native Low Power Mode
+        // 7. Apply fan speed via SMC
+        let fanValue = Int(fanSpeed)
+        if fanValue > 0 {
+            let hexRPM = fanSpeedToHex(fanValue)
+            commands.append("'\(secureDir)/smc' -k \"F0Md\" -w 01")
+            commands.append("'\(secureDir)/smc' -k \"F0Tg\" -w \(hexRPM)")
+        } else {
+            // Reset fan to automatic control
+            commands.append("'\(secureDir)/smc' -k \"F0Md\" -w 00")
+        }
+        
+        // 8. Apply native Low Power Mode
         switch lowPowerMode {
         case "On":
             commands.append("pmset -a lowpowermode 1")

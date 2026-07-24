@@ -13,11 +13,13 @@ struct ContentView: View {
     @State private var turbo = false
     @State private var lowPowerMode = "Off"
     @State private var powerLimit: Double = 14.0
+    @State private var fanSpeed: Double = 0
     
     // Baseline states to track rollback targets
     @State private var baseTurbo = false
     @State private var baseLowPowerMode = "Off"
     @State private var basePowerLimit: Double = 14.0
+    @State private var baseFanSpeed: Double = 0
     
     @State private var showingSettings = false
     @State private var isApplying = false // Tracking backend execution state
@@ -104,17 +106,17 @@ struct ContentView: View {
             // 2. Sliding Body Container (Centered vertically within the remaining frame)
             HStack(spacing: 0) {
                 mainBody
-                    .frame(width: 290, height: 64)
+                    .frame(width: 290, height: 96)
                     .disabled(isApplying)
                 
                 settingsBody
-                    .frame(width: 290, height: 64)
+                    .frame(width: 290, height: 96)
             }
-            .frame(width: 580, height: 64, alignment: .leading)
+            .frame(width: 580, height: 96, alignment: .leading)
             .offset(x: showingSettings ? -290 : 0)
             .offset(y: 38)
         }
-        .frame(width: 290, height: 114, alignment: .topLeading) // Overall height reduced to 114pt
+        .frame(width: 290, height: 146, alignment: .topLeading)
         .clipped() // Prevents sliding views from rendering outside the window boundaries
     }
     
@@ -158,6 +160,26 @@ struct ContentView: View {
                     .frame(width: 45, height: 20, alignment: .trailing)
             }
             .frame(height: 24)
+            
+            // Row 4: Fan Speed (Clamped at 9000 RPM maximum)
+            HStack(alignment: .center) {
+                Text("Fan Speed:")
+                    .font(.body)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                
+                CustomTickSlider(value: Binding(
+                    get: { min(fanSpeed, 9000.0) },
+                    set: { fanSpeed = $0 }
+                ), range: 0...9000, physicalMax: 7200, tickCount: 25, stepSize: 300)
+                
+                // Static Readout Label
+                Text(Int(fanSpeed) == 0 ? "Auto" : "\(Int(fanSpeed))")
+                    .font(.body)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 45, height: 20, alignment: .trailing)
+            }
+            .frame(height: 24)
         }
         .padding(.horizontal, 16)
     }
@@ -191,12 +213,14 @@ struct ContentView: View {
         let targetTurbo = turbo
         let targetPowerLimit = powerLimit
         let targetLowPowerMode = lowPowerMode
+        let targetFanSpeed = fanSpeed
         
         DispatchQueue.global(qos: .userInitiated).async {
             let success = PowerManager.shared.applySettings(
                 turbo: targetTurbo,
                 powerLimit: targetPowerLimit,
-                lowPowerMode: targetLowPowerMode
+                lowPowerMode: targetLowPowerMode,
+                fanSpeed: targetFanSpeed
             )
             
             DispatchQueue.main.async {
@@ -206,12 +230,14 @@ struct ContentView: View {
                     baseTurbo = targetTurbo
                     basePowerLimit = targetPowerLimit
                     baseLowPowerMode = targetLowPowerMode
+                    baseFanSpeed = targetFanSpeed
                 } else {
                     // Roll back working values to previous baseline because execution failed
                     withAnimation(.easeInOut(duration: 0.2)) {
                         turbo = baseTurbo
                         powerLimit = basePowerLimit
                         lowPowerMode = baseLowPowerMode
+                        fanSpeed = baseFanSpeed
                     }
                 }
             }
@@ -259,9 +285,10 @@ struct PointingUpThumbShape: Shape {
 struct CustomTickSlider: View {
     @Binding var value: Double
     let range: ClosedRange<Double>
-    let physicalMax: Double = 24.0 // Visually maxes out at 24W
-    let tickCount: Int = 25        // 0 to 24 visual markers
-    
+    var physicalMax: Double = 24.0 // Visually maxes out at this value
+    var tickCount: Int = 25        // Number of visual tick markers
+    var stepSize: Double = 1.0     // Snap interval for value rounding
+
     @State private var isDragging: Bool = false // Tracks active selection state
 
     var body: some View {
@@ -270,7 +297,7 @@ struct CustomTickSlider: View {
             let thumbWidth: CGFloat = 14
             let usableWidth = width - thumbWidth
             
-            // Constrain the visual thumb's layout alignment to 0...24 range
+            // Constrain the visual thumb's layout alignment to physicalMax range
             let clampedVisualValue = min(value, physicalMax)
             let percentage = CGFloat(clampedVisualValue / physicalMax)
             let thumbCenterX = (percentage * usableWidth) + (thumbWidth / 2)
@@ -320,23 +347,24 @@ struct CustomTickSlider: View {
                     .onChanged { gestureValue in
                         isDragging = true
                         
-                        let stepWidth = usableWidth / physicalMax
+                        let stepWidth = usableWidth / (physicalMax / stepSize)
                         let locationX = gestureValue.location.x - (thumbWidth / 2)
                         
                         let calculatedValue: Double
                         if locationX <= usableWidth {
-                            // Dragging inside visible bounds: 0...24W
+                            // Dragging inside visible bounds: 0...physicalMax
                             let rawPercent = max(0, locationX) / usableWidth
                             calculatedValue = Double(rawPercent) * physicalMax
                         } else {
-                            // Dragging past the right boundary: continues accumulating steps up to 43W
+                            // Dragging past the right boundary: continues accumulating steps up to range max
                             let extraWidth = locationX - usableWidth
                             let extraSteps = extraWidth / stepWidth
-                            calculatedValue = physicalMax + Double(extraSteps)
+                            calculatedValue = physicalMax + Double(extraSteps) * stepSize
                         }
                         
-                        // Bounds clamped strictly at 43W maximum
-                        value = min(max(round(calculatedValue), range.lowerBound), range.upperBound)
+                        // Snap to step interval and clamp to range
+                        let snapped = (calculatedValue / stepSize).rounded() * stepSize
+                        value = min(max(snapped, range.lowerBound), range.upperBound)
                     }
                     .onEnded { _ in
                         isDragging = false
