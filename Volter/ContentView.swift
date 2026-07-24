@@ -147,6 +147,7 @@ struct ContentView: View {
                     .font(.body)
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
+                    .frame(width: 88, alignment: .leading)
                 
                 CustomTickSlider(value: Binding(
                     get: { min(powerLimit, 43.0) },
@@ -167,6 +168,7 @@ struct ContentView: View {
                     .font(.body)
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
+                    .frame(width: 88, alignment: .leading)
                 
                 CustomTickSlider(value: Binding(
                     get: { min(fanSpeed, 9000.0) },
@@ -186,8 +188,19 @@ struct ContentView: View {
     
     // MARK: - Settings Panel View
     private var settingsBody: some View {
-        VStack {
+        VStack(spacing: 8) {
             Spacer()
+            Button(action: {
+                NSWorkspace.shared.open(URL(string: "https://github.com/willuhd/Volter")!)
+            }) {
+                Text("Browse the source code")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(.primary)
+                    .frame(maxWidth: .infinity, minHeight: 28)
+                    .background(Color(NSColor.controlColor))
+                    .cornerRadius(6)
+            }
+            .buttonStyle(.plain)
             Button(action: {
                 NSApp.terminate(nil)
             }) {
