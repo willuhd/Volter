@@ -6,8 +6,45 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		BEA915D330372D2700AFCA7C /* VolterHelper in CopyFiles */ = {isa = PBXBuildFile; fileRef = BEA915C9303729DF00AFCA7C /* VolterHelper */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		BEA915D430372D3D00AFCA7C /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = BEA0E8732FF9419700C5C4A7 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = BEA915C8303729DF00AFCA7C;
+			remoteInfo = VolterHelper;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		BEA915C7303729DF00AFCA7C /* CopyFiles */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = /usr/share/man/man1/;
+			dstSubfolderSpec = 0;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 1;
+		};
+		BEA915D230372D1300AFCA7C /* CopyFiles */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 7;
+			files = (
+				BEA915D330372D2700AFCA7C /* VolterHelper in CopyFiles */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
 		BEA0E87B2FF9419800C5C4A7 /* Volter.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Volter.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		BEA915C9303729DF00AFCA7C /* VolterHelper */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = VolterHelper; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -16,10 +53,22 @@
 			path = Volter;
 			sourceTree = "<group>";
 		};
+		BEA915CA303729DF00AFCA7C /* VolterHelper */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = VolterHelper;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		BEA0E8782FF9419700C5C4A7 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		BEA915C6303729DF00AFCA7C /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -33,6 +82,7 @@
 			isa = PBXGroup;
 			children = (
 				BEA0E87D2FF9419800C5C4A7 /* Volter */,
+				BEA915CA303729DF00AFCA7C /* VolterHelper */,
 				BEA0E87C2FF9419800C5C4A7 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -41,6 +91,7 @@
 			isa = PBXGroup;
 			children = (
 				BEA0E87B2FF9419800C5C4A7 /* Volter.app */,
+				BEA915C9303729DF00AFCA7C /* VolterHelper */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -55,10 +106,12 @@
 				BEA0E8772FF9419700C5C4A7 /* Sources */,
 				BEA0E8782FF9419700C5C4A7 /* Frameworks */,
 				BEA0E8792FF9419700C5C4A7 /* Resources */,
+				BEA915D230372D1300AFCA7C /* CopyFiles */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				BEA915D530372D3D00AFCA7C /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				BEA0E87D2FF9419800C5C4A7 /* Volter */,
@@ -69,6 +122,28 @@
 			productName = Volter;
 			productReference = BEA0E87B2FF9419800C5C4A7 /* Volter.app */;
 			productType = "com.apple.product-type.application";
+		};
+		BEA915C8303729DF00AFCA7C /* VolterHelper */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = BEA915CF303729DF00AFCA7C /* Build configuration list for PBXNativeTarget "VolterHelper" */;
+			buildPhases = (
+				BEA915C5303729DF00AFCA7C /* Sources */,
+				BEA915C6303729DF00AFCA7C /* Frameworks */,
+				BEA915C7303729DF00AFCA7C /* CopyFiles */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				BEA915CA303729DF00AFCA7C /* VolterHelper */,
+			);
+			name = VolterHelper;
+			packageProductDependencies = (
+			);
+			productName = VolterHelper;
+			productReference = BEA915C9303729DF00AFCA7C /* VolterHelper */;
+			productType = "com.apple.product-type.tool";
 		};
 /* End PBXNativeTarget section */
 
@@ -81,6 +156,9 @@
 				LastUpgradeCheck = 2630;
 				TargetAttributes = {
 					BEA0E87A2FF9419700C5C4A7 = {
+						CreatedOnToolsVersion = 26.3;
+					};
+					BEA915C8303729DF00AFCA7C = {
 						CreatedOnToolsVersion = 26.3;
 					};
 				};
@@ -100,6 +178,7 @@
 			projectRoot = "";
 			targets = (
 				BEA0E87A2FF9419700C5C4A7 /* Volter */,
+				BEA915C8303729DF00AFCA7C /* VolterHelper */,
 			);
 		};
 /* End PBXProject section */
@@ -122,7 +201,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		BEA915C5303729DF00AFCA7C /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		BEA915D530372D3D00AFCA7C /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = BEA915C8303729DF00AFCA7C /* VolterHelper */;
+			targetProxy = BEA915D430372D3D00AFCA7C /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		BEA0E8842FF9419B00C5C4A7 /* Debug */ = {
@@ -327,6 +421,38 @@
 			};
 			name = Release;
 		};
+		BEA915CD303729DF00AFCA7C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 42FUNX75XP;
+				ENABLE_HARDENED_RUNTIME = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.7;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		BEA915CE303729DF00AFCA7C /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 42FUNX75XP;
+				ENABLE_HARDENED_RUNTIME = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.7;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -344,6 +470,15 @@
 			buildConfigurations = (
 				BEA0E8872FF9419B00C5C4A7 /* Debug */,
 				BEA0E8882FF9419B00C5C4A7 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		BEA915CF303729DF00AFCA7C /* Build configuration list for PBXNativeTarget "VolterHelper" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				BEA915CD303729DF00AFCA7C /* Debug */,
+				BEA915CE303729DF00AFCA7C /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

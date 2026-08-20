@@ -22,6 +22,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     var popover: NSPopover?
 
+    func applicationWillTerminate(_ notification: Notification) {
+        // Tell root helper to exit and unlink socket (also exits automatically when ppid dies)
+        PrivilegedHelperManager.shared.terminateHelper()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Disable the Dock icon
         NSApp.setActivationPolicy(.accessory)

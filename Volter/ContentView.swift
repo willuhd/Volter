@@ -23,8 +23,17 @@ struct ContentView: View {
     
     @State private var showingSettings = false
     @State private var isApplying = false // Tracking backend execution state
+    @State private var hasPendingChanges = false // sticky flag: true after first edit until next Apply (even if you revert sliders)
     
     let modes = ["Off", "On", "Battery"]
+    
+    // Diff from last applied config — use for sticky logic
+    private var hasChanges: Bool {
+        turbo != baseTurbo ||
+        lowPowerMode != baseLowPowerMode ||
+        abs(powerLimit - basePowerLimit) > 0.001 ||
+        abs(fanSpeed - baseFanSpeed) > 0.001
+    }
     
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -48,15 +57,44 @@ struct ContentView: View {
                 
                 Spacer()
                 
-                // Right static alignment container (Anchored to prevent shifting)
-                HStack(spacing: 8) {
-                    if !showingSettings {
-                        // Settings Button: Enters settings panel
-                        Button(action: {
-                            withAnimation(.easeInOut(duration: 0.25)) {
-                                showingSettings = true
-                            }
-                        }) {
+                // Single top-right button: gear <-> blue check (settings only when no pending changes)
+                Button(action: {
+                    if showingSettings {
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            showingSettings = false
+                        }
+                    } else if hasPendingChanges {
+                        applyChanges()
+                    } else {
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            showingSettings = true
+                        }
+                    }
+                }) {
+                    ZStack {
+                        if isApplying {
+                            ProgressView()
+                                .progressViewStyle(.circular)
+                                .scaleEffect(0.5)
+                                .frame(width: 20, height: 20)
+                        } else if showingSettings {
+                            // Close settings
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundColor(.secondary)
+                                .frame(width: 20, height: 20)
+                                .background(Color(NSColor.controlColor))
+                                .clipShape(Circle())
+                        } else if hasPendingChanges {
+                            // Pending confirm — blue
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundColor(.white)
+                                .frame(width: 20, height: 20)
+                                .background(Color.blue)
+                                .clipShape(Circle())
+                        } else {
+                            // Idle — settings gear
                             Image(systemName: "gearshape.fill")
                                 .font(.system(size: 11, weight: .regular))
                                 .foregroundColor(.primary)
@@ -64,40 +102,12 @@ struct ContentView: View {
                                 .background(Color(NSColor.controlColor))
                                 .clipShape(Circle())
                         }
-                        .buttonStyle(.plain)
-                        .disabled(isApplying)
-                        .transition(.opacity.combined(with: .move(edge: .leading)))
                     }
-                    
-                    // Checkmark Button: Anchored firmly (never moves vertically or horizontally)
-                    Button(action: {
-                        if showingSettings {
-                            withAnimation(.easeInOut(duration: 0.25)) {
-                                showingSettings = false
-                            }
-                        } else {
-                            applyChanges()
-                        }
-                    }) {
-                        ZStack {
-                            if isApplying {
-                                ProgressView()
-                                    .progressViewStyle(.circular)
-                                    .scaleEffect(0.5)
-                                    .frame(width: 20, height: 20)
-                            } else {
-                                Image(systemName: "checkmark")
-                                    .font(.system(size: 9, weight: .bold))
-                                    .foregroundColor(showingSettings ? .secondary : .white)
-                                    .frame(width: 20, height: 20)
-                                    .background(showingSettings ? Color(NSColor.controlColor) : Color.blue)
-                                    .clipShape(Circle())
-                            }
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(isApplying)
                 }
+                .buttonStyle(.plain)
+                .disabled(isApplying)
+                .animation(.easeInOut(duration: 0.2), value: hasPendingChanges)
+                .animation(.easeInOut(duration: 0.25), value: showingSettings)
             }
             .padding(.horizontal, 16)
             .frame(width: 290, height: 24)
@@ -118,6 +128,14 @@ struct ContentView: View {
         }
         .frame(width: 290, height: 146, alignment: .topLeading)
         .clipped() // Prevents sliding views from rendering outside the window boundaries
+        .onChange(of: hasChanges) { _, newValue in
+            if newValue { hasPendingChanges = true }
+        }
+        // Also catch slider drags that may not trigger hasChanges immediately due to floating rounding
+        .onChange(of: turbo) { _, _ in if hasChanges { hasPendingChanges = true } }
+        .onChange(of: lowPowerMode) { _, _ in if hasChanges { hasPendingChanges = true } }
+        .onChange(of: powerLimit) { _, _ in if hasChanges { hasPendingChanges = true } }
+        .onChange(of: fanSpeed) { _, _ in if hasChanges { hasPendingChanges = true } }
     }
     
     // MARK: - Main Panel View
@@ -244,6 +262,7 @@ struct ContentView: View {
                     basePowerLimit = targetPowerLimit
                     baseLowPowerMode = targetLowPowerMode
                     baseFanSpeed = targetFanSpeed
+                    hasPendingChanges = false
                 } else {
                     // Roll back working values to previous baseline because execution failed
                     withAnimation(.easeInOut(duration: 0.2)) {
@@ -252,6 +271,7 @@ struct ContentView: View {
                         lowPowerMode = baseLowPowerMode
                         fanSpeed = baseFanSpeed
                     }
+                    hasPendingChanges = false
                 }
             }
         }
