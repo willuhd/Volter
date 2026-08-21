@@ -15,6 +15,7 @@ import Darwin
 
 let kAnVMSRClassName = "VoltageShiftAnVMSR"
 let kSecureDir = "/Library/Application Support/Volter"
+var didSetupSecureDir = false
 
 // MARK: - IOKit MSR Struct (must match kext)
 
@@ -129,6 +130,10 @@ func helperResourcesDir() -> String {
 }
 
 func ensureSecureDir() -> Bool {
+    // Fast path: already set up and kext still loaded + smc present -> no XProtect/kernelmanagerd work
+    if didSetupSecureDir && kextStatIsLoaded() && FileManager.default.fileExists(atPath: kSecureDir + "/smc") && FileManager.default.fileExists(atPath: kSecureDir + "/VoltageShift.kext") {
+        return true
+    }
     let fm = FileManager.default
     let resourcesDir = helperResourcesDir()
     fputs("[helper] resourcesDir: \(resourcesDir)\n", stderr)
@@ -139,38 +144,43 @@ func ensureSecureDir() -> Bool {
         fputs("[helper] mkdir failed: \(error)\n", stderr)
         return false
     }
-    // 2. copy smc and kext and voltageshift if needed (for fallback) - we mainly need smc + kext
-    // Note: helper itself does MSR directly, so voltageshift binary is not needed if IOKit works.
-    // But we still copy smc for fan control via smc binary (simpler than direct SMC IOKit)
+    // 2. copy smc and kext only if missing (avoid rewriting kext bundle every Apply which triggers XProtect)
     let items: [(src: String, dst: String)] = [
         (resourcesDir + "/smc", kSecureDir + "/smc"),
         (resourcesDir + "/VoltageShift.kext", kSecureDir + "/VoltageShift.kext"),
     ]
+    var didCopy = false
     for item in items {
+        if fm.fileExists(atPath: item.dst) {
+            // Already there from first setup — skip copy/chown to avoid XProtect scan
+            continue
+        }
         if fm.fileExists(atPath: item.src) {
-            // Remove dst if exists
-            try? fm.removeItem(atPath: item.dst)
             do {
                 try fm.copyItem(atPath: item.src, toPath: item.dst)
+                didCopy = true
             } catch {
                 // cp -Rf for kext directory
                 let (_, out) = runProcess("/bin/cp", ["-Rf", item.src, item.dst])
-                if !fm.fileExists(atPath: item.dst) {
+                if fm.fileExists(atPath: item.dst) {
+                    didCopy = true
+                } else {
                     fputs("[helper] copy \(item.src) -> \(item.dst) failed: \(error) \(out)\n", stderr)
                 }
             }
         } else {
             fputs("[helper] source not found: \(item.src)\n", stderr)
-            // If kext already in secureDir, that's okay
             if !fm.fileExists(atPath: item.dst) && item.dst.contains("VoltageShift") {
                 fputs("[helper] KEXT missing and source missing\n", stderr)
                 return false
             }
         }
     }
-    // 3. chown root:wheel and chmod 755
-    _ = runProcess("/usr/sbin/chown", ["-R", "root:wheel", kSecureDir])
-    _ = runProcess("/bin/chmod", ["-R", "755", kSecureDir])
+    // 3. chown root:wheel and chmod 755 only if we copied something
+    if didCopy {
+        _ = runProcess("/usr/sbin/chown", ["-R", "root:wheel", kSecureDir])
+        _ = runProcess("/bin/chmod", ["-R", "755", kSecureDir])
+    }
     // 4. kext load if needed
     if !kextStatIsLoaded() {
         fputs("[helper] kext not loaded, loading...\n", stderr)
@@ -202,6 +212,7 @@ func ensureSecureDir() -> Bool {
     } else {
         fputs("[helper] kext already loaded\n", stderr)
     }
+    didSetupSecureDir = true
     return true
 }
 
