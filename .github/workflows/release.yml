@@ -1,0 +1,166 @@
+name: Release DMG (Intel)
+
+# Primary flow is a tag push from the intel branch:
+#   git tag intel-a0.6 intel && git push origin intel-a0.6
+# Tag-push triggers work from any branch, which matters here: this file lives
+# on `intel`, not on the default branch, so GitHub does not show a Run button
+# for it. (workflow_dispatch is still listed for hand runs, e.g.
+# `gh workflow run --ref intel`, but prefer tags for anything shippable.)
+
+on:
+  push:
+    tags:
+      - "intel-*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Marketing version (CFBundleShortVersionString)"
+        required: true
+        default: "a0.6"
+
+# contents:write is needed only by the release step; the build itself
+# only reads the repository.
+permissions:
+  contents: write
+
+jobs:
+  dmg:
+    name: Build Volter-Intel.dmg
+    # Cross-compiled x86_64 on the arm64 image (Xcode 26 + macOS 26 SDK).
+    # Standard GitHub-hosted runners are free for public repositories.
+    runs-on: macos-26
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME#intel-}"
+          else
+            VERSION="${{ inputs.version }}"
+          fi
+          test -n "$VERSION" || { echo "::error::empty version"; exit 1; }
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "building version: $VERSION"
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          python3 --version
+
+      - name: Install dmgbuild
+        run: |
+          set -euo pipefail
+          pipx install dmgbuild || pipx upgrade dmgbuild
+          command -v dmgbuild
+
+      - name: Build app bundle
+        run: |
+          set -euo pipefail
+          # The signing overrides are required: the project is set to Automatic
+          # signing with DEVELOPMENT_TEAM 42FUNX75XP, and a runner has no Apple
+          # account to fetch a provisioning profile with. CODE_SIGN_IDENTITY="-"
+          # is an ad-hoc signature -- no certificate involved, so there is
+          # nothing that can expire or be revoked.
+          #
+          # The Volter scheme builds the app target, which builds VolterHelper
+          # and copies it plus the prebuilt smc / voltageshift /
+          # VoltageShift.kext into Contents/Resources.
+          #
+          # ARCHS is x86_64 only: this is the Intel line, and the arm64 slices
+          # in the prebuilt voltageshift/kext can never execute there.
+          xcodebuild \
+            -project Volter.xcodeproj \
+            -scheme Volter \
+            -configuration Release \
+            -derivedDataPath build \
+            ARCHS="x86_64" \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGNING_REQUIRED=YES \
+            DEVELOPMENT_TEAM= \
+            MARKETING_VERSION="$VERSION" \
+            build
+
+      - name: Ad-hoc sign the app bundle and its contents
+        run: |
+          set -euo pipefail
+          APP="$(find build -maxdepth 4 -name Volter.app -type d -print -quit)"
+          if [ -z "$APP" ]; then
+            echo "::error::Volter.app was not produced by the build"
+            exit 1
+          fi
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          echo "app bundle: $APP"
+
+          # Contents/Resources is a non-standard code location: codesign --deep
+          # does not reliably traverse it. So sign each bundled executable
+          # explicitly, innermost first, then seal the bundle itself (no
+          # --deep) -- that order means the app's resource seal covers the
+          # final bytes of everything inside it. Xcode's linker-level ad-hoc
+          # signature is enough for the kernel to execute a binary, but it
+          # does not seal the bundle; without the seal, Gatekeeper treats the
+          # app as tampered with and reports "is damaged and can't be opened",
+          # which on Apple Silicon downloads has no approval path at all.
+          #
+          # The .kext is ad-hoc signed only for seal consistency. An ad-hoc
+          # signature neither helps nor hinders kext loading, which stays
+          # governed by the target Mac's kext policy exactly as today.
+          RES="$APP/Contents/Resources"
+          for f in "$RES/smc" "$RES/voltageshift" \
+                   "$RES/VolterHelper" "$RES/VoltageShift.kext"; do
+            if [ -e "$f" ]; then
+              codesign --force --options runtime --timestamp=none --sign - "$f"
+            else
+              echo "::error::expected bundle content missing: $f"
+              exit 1
+            fi
+          done
+          codesign --force --options runtime --timestamp=none --sign - "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
+
+          echo "--- app signature ---"
+          codesign -dvvv "$APP" 2>&1 \
+            | grep -E "Authority|Signature|TeamIdentifier|flags=|Format" || true
+
+      - name: Build DMG
+        run: |
+          set -euo pipefail
+          .github/release/make-dmg.sh "$APP" "Volter-Intel-$VERSION.dmg"
+
+          echo "--- image ---"
+          hdiutil imageinfo "Volter-Intel-$VERSION.dmg" \
+            | grep -E "Format Description|Class Name|Total Bytes" || true
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v7
+        with:
+          path: Volter-Intel-*.dmg
+          # Upload without wrapping it in a zip so the artifact downloads as a
+          # plain .dmg. With archive: false only one file may be uploaded, and
+          # the artifact takes the file's name -- `name` is ignored.
+          archive: false
+          if-no-files-found: error
+
+      - name: Attach DMG to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          DMGS=(Volter-Intel-*.dmg)
+          [ "${#DMGS[@]}" -eq 1 ] || { echo "::error::expected exactly one DMG"; exit 1; }
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${DMGS[0]}" --clobber
+          else
+            gh release create "$TAG" "${DMGS[0]}" --title "$TAG" --generate-notes
+          fi
