@@ -9,30 +9,27 @@ import SwiftUI
 import AppKit
 
 struct ContentView: View {
-    // Current working states
-    @State private var turbo = false
-    @State private var lowPowerMode = "Off"
-    @State private var powerLimit: Double = 14.0
-    @State private var fanSpeed: Double = 0
-    
-    // Baseline states to track rollback targets
-    @State private var baseTurbo = false
-    @State private var baseLowPowerMode = "Off"
-    @State private var basePowerLimit: Double = 14.0
-    @State private var baseFanSpeed: Double = 0
-    
+    // GPU cap in watts. 0 = Auto (uncapped). defaultMaxWatts is nil until the first helper read.
+    @State private var gpuCap: Double = 0.0
+    @State private var baseGpuCap: Double = 0.0
+    @State private var defaultMaxWatts: Double? = nil
+
     @State private var showingSettings = false
     @State private var isApplying = false // Tracking backend execution state
     @State private var hasPendingChanges = false // sticky flag: true after first edit until next Apply (even if you revert sliders)
-    
-    let modes = ["Off", "On", "Battery"]
-    
+
+    /// Chip marketing name, read once (sudoless sysctl, e.g. "M5 Pro").
+    private static let chipLabel: String = PowerManager.chipName()
+
+    /// Hard "Max" (100W): reaching 28W on the slider snaps to restore.
+    /// Visible track ends at 20W; dragging past it accumulates invisibly to 28W.
+    private var sliderMax: Double { PowerManager.snapToMaxWatts }
+    private var trackMax: Double { 20.0 }
+    private var isAtMax: Bool { gpuCap >= PowerManager.snapToMaxWatts - 0.001 }
+
     // Diff from last applied config — use for sticky logic
     private var hasChanges: Bool {
-        turbo != baseTurbo ||
-        lowPowerMode != baseLowPowerMode ||
-        abs(powerLimit - basePowerLimit) > 0.001 ||
-        abs(fanSpeed - baseFanSpeed) > 0.001
+        defaultMaxWatts != nil && abs(gpuCap - baseGpuCap) > 0.001
     }
     
     var body: some View {
@@ -40,13 +37,11 @@ struct ContentView: View {
             
             // 1. Static Header Row: Explicitly sized to 290px to lock all elements in place
             HStack(alignment: .center) {
-                // Left Title / Checkbox (Cross-fade transition)
+                // Left Title (Cross-fade transition)
                 ZStack(alignment: .leading) {
                     if !showingSettings {
-                        Toggle("Turbo", isOn: $turbo)
-                            .toggleStyle(.checkbox)
-                            .font(.body)
-                            .disabled(isApplying)
+                        Text(Self.chipLabel)
+                            .font(.headline)
                             .transition(.opacity)
                     } else {
                         Text("Volter")
@@ -116,109 +111,66 @@ struct ContentView: View {
             // 2. Sliding Body Container (Centered vertically within the remaining frame)
             HStack(spacing: 0) {
                 mainBody
-                    .frame(width: 290, height: 96)
+                    .frame(width: 290, height: 40)
                     .disabled(isApplying)
                 
                 settingsBody
-                    .frame(width: 290, height: 96)
+                    .frame(width: 290, height: 40)
             }
-            .frame(width: 580, height: 96, alignment: .leading)
+            .frame(width: 580, height: 40, alignment: .leading)
             .offset(x: showingSettings ? -290 : 0)
             .offset(y: 38)
         }
-        .frame(width: 290, height: 146, alignment: .topLeading)
+        .frame(width: 290, height: 90, alignment: .topLeading)
         .clipped() // Prevents sliding views from rendering outside the window boundaries
         .onChange(of: hasChanges) { _, newValue in
             if newValue { hasPendingChanges = true }
         }
-        // Also catch slider drags that may not trigger hasChanges immediately due to floating rounding
-        .onChange(of: turbo) { _, _ in if hasChanges { hasPendingChanges = true } }
-        .onChange(of: lowPowerMode) { _, _ in if hasChanges { hasPendingChanges = true } }
-        .onChange(of: powerLimit) { _, _ in if hasChanges { hasPendingChanges = true } }
-        .onChange(of: fanSpeed) { _, _ in if hasChanges { hasPendingChanges = true } }
+        .onChange(of: gpuCap) { _, _ in if hasChanges { hasPendingChanges = true } }
+        .task {
+            refreshFromHelper()
+        }
     }
     
     // MARK: - Main Panel View
     private var mainBody: some View {
-        VStack(spacing: 8) {
-            // Row 2: Low Power Mode
-            HStack(alignment: .center) {
-                Text("Low Power Mode:")
-                    .font(.body)
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-                
-                Spacer(minLength: 12)
-                
-                Picker("", selection: $lowPowerMode) {
-                    ForEach(modes, id: \.self) { mode in
-                        Text(mode).tag(mode)
-                    }
+        Group {
+            if defaultMaxWatts != nil {
+                // GPU cap slider (far left = Auto, far right = Max/restore)
+                HStack(alignment: .center) {
+                    Text("Power:")
+                        .font(.body)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .frame(width: 88, alignment: .leading)
+
+                    CustomTickSlider(value: $gpuCap, range: 0...sliderMax,
+                                     physicalMax: trackMax, tickCount: 25, stepSize: 1.0)
+
+                    // Static Readout Label (mirrors the old fan Auto pattern)
+                    Text(gpuCap <= 0.001 ? "Auto" : (isAtMax ? "Max" : String(format: "%gW", gpuCap)))
+                        .font(.body)
+                        .multilineTextAlignment(.trailing)
+                        .frame(width: 55, height: 20, alignment: .trailing)
                 }
-                .pickerStyle(.segmented)
+                .frame(height: 24)
+                .padding(.horizontal, 16)
+            } else {
+                HStack {
+                    Spacer()
+                    ProgressView()
+                        .scaleEffect(0.7)
+                    Spacer()
+                }
+                .padding(.horizontal, 16)
             }
-            .frame(height: 22)
-            
-            // Row 3: Power Limit (Clamped at 43W maximum)
-            HStack(alignment: .center) {
-                Text("Power Limit:")
-                    .font(.body)
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .frame(width: 88, alignment: .leading)
-                
-                CustomTickSlider(value: Binding(
-                    get: { min(powerLimit, 43.0) },
-                    set: { powerLimit = $0 }
-                ), range: 0...43)
-                
-                // Static Readout Label
-                Text(Int(powerLimit) == 0 ? "Off" : "\(Int(powerLimit))W")
-                    .font(.body)
-                    .multilineTextAlignment(.trailing)
-                    .frame(width: 45, height: 20, alignment: .trailing)
-            }
-            .frame(height: 24)
-            
-            // Row 4: Fan Speed (Clamped at 9000 RPM maximum)
-            HStack(alignment: .center) {
-                Text("Fan Speed:")
-                    .font(.body)
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .frame(width: 88, alignment: .leading)
-                
-                CustomTickSlider(value: Binding(
-                    get: { min(fanSpeed, 9000.0) },
-                    set: { fanSpeed = $0 }
-                ), range: 0...9000, physicalMax: 7200, tickCount: 25, stepSize: 300)
-                
-                // Static Readout Label
-                Text(Int(fanSpeed) == 0 ? "Auto" : "\(Int(fanSpeed))")
-                    .font(.body)
-                    .multilineTextAlignment(.trailing)
-                    .frame(width: 45, height: 20, alignment: .trailing)
-            }
-            .frame(height: 24)
         }
-        .padding(.horizontal, 16)
     }
     
     // MARK: - Settings Panel View
     private var settingsBody: some View {
         VStack(spacing: 8) {
             Spacer()
-            Button(action: {
-                NSWorkspace.shared.open(URL(string: "https://github.com/willuhd/Volter")!)
-            }) {
-                Text("Browse the source code")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(.primary)
-                    .frame(maxWidth: .infinity, minHeight: 28)
-                    .background(Color(NSColor.controlColor))
-                    .cornerRadius(6)
-            }
-            .buttonStyle(.plain)
             Button(action: {
                 NSApp.terminate(nil)
             }) {
@@ -236,40 +188,45 @@ struct ContentView: View {
     }
     
     // MARK: - Controller Actions
+    private func refreshFromHelper() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let s = PowerManager.shared.readStatus() else { return }
+            DispatchQueue.main.async {
+                defaultMaxWatts = s.defaultMaxWatts
+                // Live applied cap; Auto (0) when uncapped or capped above our range
+                if s.capWatts >= s.defaultMaxWatts - 0.001 || s.capWatts > PowerManager.snapToMaxWatts {
+                    gpuCap = 0.0
+                } else {
+                    gpuCap = s.capWatts
+                }
+                baseGpuCap = gpuCap
+                hasPendingChanges = false
+            }
+        }
+    }
+
     private func applyChanges() {
         // Prevent concurrent execution queueing
         guard !isApplying else { return }
+        guard defaultMaxWatts != nil else { return }
         isApplying = true
-        
-        let targetTurbo = turbo
-        let targetPowerLimit = powerLimit
-        let targetLowPowerMode = lowPowerMode
-        let targetFanSpeed = fanSpeed
-        
+
+        let targetCap = gpuCap
+
         DispatchQueue.global(qos: .userInitiated).async {
-            let success = PowerManager.shared.applySettings(
-                turbo: targetTurbo,
-                powerLimit: targetPowerLimit,
-                lowPowerMode: targetLowPowerMode,
-                fanSpeed: targetFanSpeed
-            )
-            
+            let status = PowerManager.shared.applyCap(watts: targetCap)
+
             DispatchQueue.main.async {
                 isApplying = false
-                if success {
-                    // Update baseline targets on authorization success
-                    baseTurbo = targetTurbo
-                    basePowerLimit = targetPowerLimit
-                    baseLowPowerMode = targetLowPowerMode
-                    baseFanSpeed = targetFanSpeed
+                if let s = status {
+                    // Update baseline targets on success
+                    baseGpuCap = targetCap
+                    defaultMaxWatts = s.defaultMaxWatts
                     hasPendingChanges = false
                 } else {
-                    // Roll back working values to previous baseline because execution failed
+                    // Roll back working value to previous baseline because execution failed
                     withAnimation(.easeInOut(duration: 0.2)) {
-                        turbo = baseTurbo
-                        powerLimit = basePowerLimit
-                        lowPowerMode = baseLowPowerMode
-                        fanSpeed = baseFanSpeed
+                        gpuCap = baseGpuCap
                     }
                     hasPendingChanges = false
                 }

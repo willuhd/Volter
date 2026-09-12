@@ -1,408 +1,92 @@
 //
 //  main.swift
 //  VolterHelper - Privileged helper daemon (runs as root)
-//  Approach 2: Spawn a Root Worker on App Startup - one Touch ID per launch
+//  Apple Silicon edition: GPU power-cap control via the AGX driver.
+//  No kext, no MSR, no SMC writes.
 //
-//  No Apple Developer certificate required.
+//  AGX interface ported from maderix/apple-gpu-dvfs,
+//  MIT License, Copyright (c) 2026 Manjeet Singh:
+//    write {"SetMaxGPUAbsolutePower": true, "AbsoluteTarget": mW}
+//    read  "MaxGPUAbsolutePower" (current cap, mW)
+//
 //  Comunicates via Unix Domain Socket with token auth.
+//  One Touch ID per app launch. No Apple Developer certificate required.
 //
 
 import Foundation
 import IOKit
 import Darwin
 
-// MARK: - Constants
+// MARK: - AGX GPU Interface
 
-let kAnVMSRClassName = "VoltageShiftAnVMSR"
-let kSecureDir = "/Library/Application Support/Volter"
-var didSetupSecureDir = false
+/// Ordered by generation (newest first); plain "AGXAccelerator" last as catch-all.
+let kAGXClasses = [
+    "AGXAcceleratorG17X",
+    "AGXAcceleratorG16G",
+    "AGXAcceleratorG15X",
+    "AGXAcceleratorG15G",
+    "AGXAcceleratorG14X",
+    "AGXAcceleratorG13G",
+    "AGXAccelerator",
+]
 
-// MARK: - IOKit MSR Struct (must match kext)
+/// Firmware floor observed upstream (1W "min" preset). Never write below this.
+let kMinCapMW: Int64 = 1000
 
-struct MSRInOut {
-    var action: UInt32 = 0
-    var msr: UInt32 = 0
-    var param: UInt64 = 0
+/// First matching AGX service. Caller must IOObjectRelease when done.
+func agxService() -> io_service_t {
+    for cls in kAGXClasses {
+        let svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(cls))
+        if svc != 0 { return svc }
+    }
+    return 0
 }
 
-let kActionRDMSR: UInt32 = 0
-let kActionWRMSR: UInt32 = 1
+func agxReadInt64(_ key: String) -> Int64? {
+    let svc = agxService()
+    if svc == 0 { return nil }
+    defer { IOObjectRelease(svc) }
+    guard let unmanaged = IORegistryEntryCreateCFProperty(svc, key as CFString, kCFAllocatorDefault, 0) else {
+        return nil
+    }
+    let raw = unmanaged.takeRetainedValue()
+    guard CFGetTypeID(raw) == CFNumberGetTypeID() else { return nil }
+    let num = raw as! CFNumber
+    var value: Int64 = 0
+    guard CFNumberGetValue(num, .sInt64Type, &value) else { return nil }
+    return value
+}
+
+/// Current GPU power cap in mW.
+func agxCurrentMaxMW() -> Int64? {
+    agxReadInt64("MaxGPUAbsolutePower")
+}
+
+/// Set the GPU power cap. Returns the IOKit result (KERN_SUCCESS on success).
+func agxSetCapMW(_ mw: Int64) -> kern_return_t {
+    let svc = agxService()
+    if svc == 0 { return KERN_FAILURE }
+    defer { IOObjectRelease(svc) }
+    let dict: [String: Any] = [
+        "SetMaxGPUAbsolutePower": true,
+        "AbsoluteTarget": mw,
+    ]
+    return IORegistryEntrySetCFProperties(svc, dict as CFDictionary)
+}
 
 // MARK: - JSON Protocol
 
 struct ApplyRequest: Codable {
     let token: String
-    let turbo: Bool?
-    let powerLimit: Double?
-    let lowPowerMode: String?
-    let fanSpeed: Double?
-    let op: String? // "exit" or nil = apply
+    let gpuCapMW: Int64?
+    let op: String? // "status" | "restore" | "exit" | nil = apply cap
 }
 
 struct ApplyResponse: Codable {
     let success: Bool
     let message: String
-}
-
-// MARK: - IOKit Helpers
-
-func getService() -> io_service_t {
-    var masterPort: mach_port_t = 0
-    // IOMainPort is preferred on 12+, fallback to kIOMainPortDefault
-    var ret = IOMainPort(mach_port_t(MACH_PORT_NULL), &masterPort)
-    if ret != KERN_SUCCESS {
-        ret = IOMainPort(kIOMainPortDefault, &masterPort)
-        if ret != KERN_SUCCESS {
-            fputs("[helper] IOMainPort failed: \(ret)\n", stderr)
-            return 0
-        }
-    }
-    var iter: io_iterator_t = 0
-    ret = IOServiceGetMatchingServices(masterPort, IOServiceMatching(kAnVMSRClassName), &iter)
-    if ret != KERN_SUCCESS {
-        // not running is not an error - caller will load kext
-        return 0
-    }
-    let service = IOIteratorNext(iter)
-    IOObjectRelease(iter)
-    if service == 0 { return 0 }
-    // Optional path check
-    var path = [CChar](repeating: 0, count: 512)
-    _ = IORegistryEntryGetPath(service, kIOServicePlane, &path)
-    return service
-}
-
-func kextStatIsLoaded() -> Bool {
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/bin/kextstat")
-    let pipe = Pipe()
-    task.standardOutput = pipe
-    task.standardError = Pipe()
-    do {
-        try task.run()
-        task.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let out = String(data: data, encoding: .utf8) ?? ""
-        return out.contains("VoltageShift")
-    } catch {
-        return false
-    }
-}
-
-func runProcess(_ path: String, _ args: [String]) -> (Int32, String) {
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: path)
-    task.arguments = args
-    let pipe = Pipe()
-    let errPipe = Pipe()
-    task.standardOutput = pipe
-    task.standardError = errPipe
-    do {
-        try task.run()
-        task.waitUntilExit()
-        let outData = pipe.fileHandleForReading.readDataToEndOfFile()
-        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-        let out = String(data: outData, encoding: .utf8) ?? ""
-        let err = String(data: errData, encoding: .utf8) ?? ""
-        return (task.terminationStatus, out + err)
-    } catch {
-        return (-1, "\(error)")
-    }
-}
-
-func helperResourcesDir() -> String {
-    // Helper is at Volter.app/Contents/Resources/VolterHelper
-    // Resources dir is parent of helper binary
-    let execPath = CommandLine.arguments[0]
-    let execURL = URL(fileURLWithPath: execPath)
-    let dir = execURL.deletingLastPathComponent().path
-    // If launched via xcode build dir (DerivedData), helper's dir may be Products dir, not Resources
-    // Fallback: also check Bundle.main
-    if FileManager.default.fileExists(atPath: dir + "/VoltageShift.kext") {
-        return dir
-    }
-    if let bundleResources = Bundle.main.resourcePath, FileManager.default.fileExists(atPath: bundleResources + "/VoltageShift.kext") {
-        return bundleResources
-    }
-    // Last fallback: try Volter.app Resources relative to exec
-    // Helper in .../Volter.app/Contents/MacOS/VolterHelper? but we put in Resources
-    return dir
-}
-
-func ensureSecureDir() -> Bool {
-    // Fast path: already set up and kext still loaded + smc present -> no XProtect/kernelmanagerd work
-    if didSetupSecureDir && kextStatIsLoaded() && FileManager.default.fileExists(atPath: kSecureDir + "/smc") && FileManager.default.fileExists(atPath: kSecureDir + "/VoltageShift.kext") {
-        return true
-    }
-    let fm = FileManager.default
-    let resourcesDir = helperResourcesDir()
-    fputs("[helper] resourcesDir: \(resourcesDir)\n", stderr)
-    // 1. mkdir -p secureDir
-    do {
-        try fm.createDirectory(atPath: kSecureDir, withIntermediateDirectories: true, attributes: [FileAttributeKey.posixPermissions: 0o755])
-    } catch {
-        fputs("[helper] mkdir failed: \(error)\n", stderr)
-        return false
-    }
-    // 2. copy smc and kext only if missing (avoid rewriting kext bundle every Apply which triggers XProtect)
-    let items: [(src: String, dst: String)] = [
-        (resourcesDir + "/smc", kSecureDir + "/smc"),
-        (resourcesDir + "/VoltageShift.kext", kSecureDir + "/VoltageShift.kext"),
-    ]
-    var didCopy = false
-    for item in items {
-        if fm.fileExists(atPath: item.dst) {
-            // Already there from first setup — skip copy/chown to avoid XProtect scan
-            continue
-        }
-        if fm.fileExists(atPath: item.src) {
-            do {
-                try fm.copyItem(atPath: item.src, toPath: item.dst)
-                didCopy = true
-            } catch {
-                // cp -Rf for kext directory
-                let (_, out) = runProcess("/bin/cp", ["-Rf", item.src, item.dst])
-                if fm.fileExists(atPath: item.dst) {
-                    didCopy = true
-                } else {
-                    fputs("[helper] copy \(item.src) -> \(item.dst) failed: \(error) \(out)\n", stderr)
-                }
-            }
-        } else {
-            fputs("[helper] source not found: \(item.src)\n", stderr)
-            if !fm.fileExists(atPath: item.dst) && item.dst.contains("VoltageShift") {
-                fputs("[helper] KEXT missing and source missing\n", stderr)
-                return false
-            }
-        }
-    }
-    // 3. chown root:wheel and chmod 755 only if we copied something
-    if didCopy {
-        _ = runProcess("/usr/sbin/chown", ["-R", "root:wheel", kSecureDir])
-        _ = runProcess("/bin/chmod", ["-R", "755", kSecureDir])
-    }
-    // 4. kext load if needed
-    if !kextStatIsLoaded() {
-        fputs("[helper] kext not loaded, loading...\n", stderr)
-        // try kextutil first (more verbose, handles -r)
-        let resDir = helperResourcesDir()
-        var (status, out) = runProcess("/usr/bin/kextutil", ["-q", "-r", resDir, "-b", "com.sicreative.VoltageShift", kSecureDir + "/VoltageShift.kext"])
-        if status != 0 {
-            fputs("[helper] kextutil failed \(status) \(out), trying kextload\n", stderr)
-            (status, out) = runProcess("/sbin/kextload", [kSecureDir + "/VoltageShift.kext"])
-            fputs("[helper] kextload \(status) \(out)\n", stderr)
-            if status != 0 {
-                // Try fixing perms again and retry
-                _ = runProcess("/usr/sbin/chown", ["-R", "root:wheel", kSecureDir + "/VoltageShift.kext"])
-                _ = runProcess("/bin/chmod", ["-R", "755", kSecureDir + "/VoltageShift.kext"])
-                (status, out) = runProcess("/sbin/kextload", [kSecureDir + "/VoltageShift.kext"])
-                if status != 0 {
-                    fputs("[helper] kextload retry failed \(status) \(out)\n", stderr)
-                    // Don't return false yet - IOService may still appear after a moment
-                }
-            }
-        } else {
-            fputs("[helper] kextutil success\n", stderr)
-        }
-        // Wait a bit for service to appear
-        for _ in 0..<10 {
-            if getService() != 0 { break }
-            usleep(200_000)
-        }
-    } else {
-        fputs("[helper] kext already loaded\n", stderr)
-    }
-    didSetupSecureDir = true
-    return true
-}
-
-// MARK: - MSR Operations via IOKit
-
-func withIOConnection<T>(_ body: (io_connect_t) throws -> T) -> T? {
-    let service = getService()
-    if service == 0 {
-        fputs("[helper] getService() returned 0, trying ensureSecureDir+load\n", stderr)
-        if !ensureSecureDir() {
-            return nil
-        }
-        // retry
-        let service2 = getService()
-        if service2 == 0 {
-            fputs("[helper] still no service after load\n", stderr)
-            return nil
-        }
-        var connect: io_connect_t = 0
-        let ret = IOServiceOpen(service2, mach_task_self_, 0, &connect)
-        IOObjectRelease(service2)
-        if ret != KERN_SUCCESS {
-            fputs("[helper] IOServiceOpen failed \(ret)\n", stderr)
-            return nil
-        }
-        defer { IOServiceClose(connect) }
-        do {
-            return try body(connect)
-        } catch {
-            fputs("[helper] body error \(error)\n", stderr)
-            return nil
-        }
-    }
-    var connect: io_connect_t = 0
-    let ret = IOServiceOpen(service, mach_task_self_, 0, &connect)
-    IOObjectRelease(service)
-    if ret != KERN_SUCCESS {
-        fputs("[helper] IOServiceOpen failed \(ret)\n", stderr)
-        return nil
-    }
-    defer { IOServiceClose(connect) }
-    do {
-        return try body(connect)
-    } catch {
-        fputs("[helper] body error \(error)\n", stderr)
-        return nil
-    }
-}
-
-func rdmsr(connect: io_connect_t, msr: UInt32) -> UInt64? {
-    var input = MSRInOut(action: kActionRDMSR, msr: msr, param: 0)
-    var output = MSRInOut()
-    var outSize = MemoryLayout<MSRInOut>.size
-    let ret = withUnsafePointer(to: &input) { inPtr in
-        withUnsafeMutablePointer(to: &output) { outPtr in
-            IOConnectCallStructMethod(connect, UInt32(kActionRDMSR),
-                                      inPtr, MemoryLayout<MSRInOut>.size,
-                                      outPtr, &outSize)
-        }
-    }
-    if ret != KERN_SUCCESS {
-        fputs("[helper] RDMSR 0x\(String(msr, radix:16)) failed \(ret)\n", stderr)
-        return nil
-    }
-    return output.param
-}
-
-func wrmsr(connect: io_connect_t, msr: UInt32, value: UInt64) -> Bool {
-    var input = MSRInOut(action: kActionWRMSR, msr: msr, param: value)
-    var output = MSRInOut()
-    var outSize = MemoryLayout<MSRInOut>.size
-    let ret = withUnsafePointer(to: &input) { inPtr in
-        withUnsafeMutablePointer(to: &output) { outPtr in
-            IOConnectCallStructMethod(connect, UInt32(kActionWRMSR),
-                                      inPtr, MemoryLayout<MSRInOut>.size,
-                                      outPtr, &outSize)
-        }
-    }
-    if ret != KERN_SUCCESS {
-        fputs("[helper] WRMSR 0x\(String(msr, radix:16))=0x\(String(value, radix:16)) failed \(ret)\n", stderr)
-        return false
-    }
-    return true
-}
-
-func setTurbo(enable: Bool) -> Bool {
-    guard let ok = withIOConnection({ connect -> Bool in
-        guard let val = rdmsr(connect: connect, msr: 0x1a0) else { return false }
-        let isDisabled = ((val >> 38) & 0x1) == 1
-        fputs("[helper] current turbo disabled=\(isDisabled) val=0x\(String(val, radix:16))\n", stderr)
-        var newVal = val
-        if enable {
-            newVal &= ~((UInt64(1) << 38))
-        } else {
-            newVal |= (UInt64(1) << 38)
-        }
-        if newVal == val {
-            fputs("[helper] turbo already \(enable ? "enabled" : "disabled")\n", stderr)
-            return true
-        }
-        return wrmsr(connect: connect, msr: 0x1a0, value: newVal)
-    }) else { return false }
-    return ok
-}
-
-func setPowerLimit(plWatts: Int) -> Bool {
-    if plWatts <= 0 { return true } // 0 means don't touch
-    let p1 = plWatts * 8
-    let p2 = plWatts * 8 // Volter currently sets PL1=PL2
-    guard let ok = withIOConnection({ connect -> Bool in
-        guard let cur = rdmsr(connect: connect, msr: 0x610) else { return false }
-        let p1cur = (cur & 0x7FFF)
-        let p2cur = ((cur >> 32) & 0x7FFF)
-        fputs("[helper] current PL1=\(p1cur/8)W PL2=\(p2cur/8)W raw=0x\(String(cur, radix:16))\n", stderr)
-        if p1 < 5*8 || p2 < 5*8 {
-            fputs("[helper] power too low\n", stderr)
-            return false
-        }
-        var newVal = cur
-        // Volter uses bits 0..14 and 32..46
-        for i in 0..<15 {
-            let bit: UInt64 = UInt64((p1 >> i) & 0x1)
-            let mask: UInt64 = UInt64(1) << i
-            if bit == 1 { newVal |= mask } else { newVal &= ~mask }
-        }
-        for i in 32..<47 {
-            let p2bit = (p2 >> (i-32)) & 0x1
-            let mask: UInt64 = UInt64(1) << i
-            if p2bit == 1 { newVal |= mask } else { newVal &= ~mask }
-        }
-        fputs("[helper] write 0x610 0x\(String(newVal, radix:16)) (was 0x\(String(cur, radix:16)))\n", stderr)
-        return wrmsr(connect: connect, msr: 0x610, value: newVal)
-    }) else { return false }
-    return ok
-}
-
-// MARK: - SMC / pmset via Process (helper is root, so no sudo needed)
-
-func fanSpeedToHex(_ rpm: Int) -> String {
-    let f = Float(rpm)
-    let bits = f.bitPattern
-    let b0 = UInt8(bits & 0xFF)
-    let b1 = UInt8((bits >> 8) & 0xFF)
-    let b2 = UInt8((bits >> 16) & 0xFF)
-    let b3 = UInt8((bits >> 24) & 0xFF)
-    return String(format: "%02x%02x%02x%02x", b0, b1, b2, b3)
-}
-
-func setFan(rpm: Int) -> Bool {
-    let smcPath = kSecureDir + "/smc"
-    var path = smcPath
-    if !FileManager.default.fileExists(atPath: path) {
-        // fallback to bundled smc in resources dir
-        path = helperResourcesDir() + "/smc"
-    }
-    if !FileManager.default.fileExists(atPath: path) {
-        fputs("[helper] smc not found at \(path)\n", stderr)
-        return false
-    }
-    if rpm > 0 {
-        let hex = fanSpeedToHex(rpm)
-        let (s1, o1) = runProcess(path, ["-k", "F0Md", "-w", "01"])
-        fputs("[helper] smc F0Md 01 -> \(s1) \(o1)\n", stderr)
-        let (s2, o2) = runProcess(path, ["-k", "F0Tg", "-w", hex])
-        fputs("[helper] smc F0Tg \(hex) -> \(s2) \(o2)\n", stderr)
-        return s1 == 0 && s2 == 0
-    } else {
-        let (s, o) = runProcess(path, ["-k", "F0Md", "-w", "00"])
-        fputs("[helper] smc F0Md 00 -> \(s) \(o)\n", stderr)
-        return s == 0
-    }
-}
-
-func setLowPowerMode(_ mode: String) -> Bool {
-    let pmset = "/usr/bin/pmset"
-    var status: Int32 = 0
-    var out = ""
-    switch mode {
-    case "On":
-        (status, out) = runProcess(pmset, ["-a", "lowpowermode", "1"])
-    case "Battery":
-        let (s1, o1) = runProcess(pmset, ["-b", "lowpowermode", "1"])
-        let (s2, o2) = runProcess(pmset, ["-c", "lowpowermode", "0"])
-        fputs("[helper] pmset battery \(s1) \(o1) \(s2) \(o2)\n", stderr)
-        return s1 == 0 && s2 == 0
-    default: // Off
-        (status, out) = runProcess(pmset, ["-a", "lowpowermode", "0"])
-    }
-    fputs("[helper] pmset \(mode) -> \(status) \(out)\n", stderr)
-    return status == 0
+    let origMaxMW: Int64?
+    let maxCapMW: Int64?
 }
 
 // MARK: - Socket helpers
@@ -455,6 +139,19 @@ func readFrame(fd: Int32) -> Data? {
     return readAll(fd: fd, count: Int(len))
 }
 
+func sendResponse(fd: Int32, success: Bool, message: String) {
+    let resp = ApplyResponse(
+        success: success,
+        message: message,
+        origMaxMW: kDefaultMaxMW,
+        maxCapMW: agxCurrentMaxMW()
+    )
+    if let data = try? JSONEncoder().encode(resp) {
+        _ = writeFrame(fd: fd, data: data)
+    }
+    fputs("[helper] done success=\(success) \(message)\n", stderr)
+}
+
 // MARK: - Main
 
 func printUsage() {
@@ -487,9 +184,32 @@ guard let sockPath = socketPath, !sockPath.isEmpty, let expectedToken = token, !
 }
 if ppid == 0 { ppid = getppid() }
 
+// Hard "Max": 100W for all Apple Silicon instead of a live-read default.
+// (A live read while capped returns the cap, not the default — never trust it.)
+// Slightly above real defaults (M5 Pro ~99.3W); firmware treats it as uncapped.
+let kDefaultMaxMW: Int64 = 100_000
+
+do {
+    let probe = agxService()
+    if probe == 0 {
+        fputs("[helper] WARNING: no AGX service at startup, will retry per request\n", stderr)
+    } else {
+        IOObjectRelease(probe)
+        fputs("[helper] AGX GPU present, hard max \(kDefaultMaxMW) mW\n", stderr)
+    }
+}
+
+func restoreDefaultCap() -> Bool {
+    let kr = agxSetCapMW(kDefaultMaxMW)
+    fputs("[helper] restore \(kDefaultMaxMW) mW -> 0x\(String(kr, radix: 16))\n", stderr)
+    return kr == KERN_SUCCESS
+}
+
 // Setup signal handler to clean up socket
 var globalSocketPathForCleanup = sockPath
 func cleanupAndExit(_ code: Int32) -> Never {
+    // Never leave the user stuck capped: restore first, then unlink.
+    _ = restoreDefaultCap()
     unlink(globalSocketPathForCleanup)
     // Try to remove parent dir if empty and is our volter-xxx dir
     let dir = (globalSocketPathForCleanup as NSString).deletingLastPathComponent
@@ -551,25 +271,16 @@ if listen(listenFD, 5) != 0 { perror("listen"); close(listenFD); exit(1) }
 
 fputs("[helper] listening on \(sockPath) ppid=\(ppid) token=\(expectedToken.prefix(6))***\n", stderr)
 
-// Ensure secure dir and kext loaded upfront (so first request is fast)
-if !ensureSecureDir() {
-    fputs("[helper] ensureSecureDir failed at startup (will retry per request)\n", stderr)
-}
-
-// Parent watchdog - exit when parent dies
+// Parent watchdog - exit when parent dies (cleanupAndExit restores the cap first)
 DispatchQueue.global(qos: .background).async {
     while true {
         if kill(ppid, 0) != 0 {
             fputs("[helper] parent \(ppid) died, cleaning up\n", stderr)
             cleanupAndExit(0)
         }
-        // Also check if parent pid was reused? Check parent is still same? Not critical for session daemon
         sleep(1)
     }
 }
-
-// Make listen socket non-blocking? Keep blocking but accept loop handles
-// Set timeout via dispatch?
 
 // Accept loop
 while true {
@@ -584,20 +295,13 @@ while true {
     var gid: gid_t = 0
     if getpeereid(clientFD, &uid, &gid) == 0 {
         if uid != getuid() && uid != 0 {
-            // Allow root and the user who launched Volter
-            // getuid() here is 0 (root), so we need to compare to expected user's uid?
-            // Helper is root, getuid()==0, so check client uid matches parent's uid
-            // parent's uid = uid of ppid's user - easiest: allow any uid that is not 0 but we log
-            // Actually helper is root, getuid()==0, so the check uid != 0 will pass for normal user
-            // We want to allow the Volter user's uid only - get parent's uid via stat on /proc? Simpler: allow uid == 501 etc
-            // We'll just log and continue, but require token anyway
             fputs("[helper] peer uid=\(uid) gid=\(gid) (expected Volter user)\n", stderr)
         }
     }
     // Use timeout for read - set SO_RCVTIMEO
     var tv = timeval(tv_sec: 10, tv_usec: 0)
     setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-    
+
     DispatchQueue.global().async {
         defer { close(clientFD) }
         guard let data = readFrame(fd: clientFD) else {
@@ -607,58 +311,64 @@ while true {
         let decoder = JSONDecoder()
         guard let req = try? decoder.decode(ApplyRequest.self, from: data) else {
             fputs("[helper] decode failed \(String(data: data, encoding: .utf8) ?? "")\n", stderr)
-            let resp = ApplyResponse(success: false, message: "invalid json")
-            if let respData = try? JSONEncoder().encode(resp) { _ = writeFrame(fd: clientFD, data: respData) }
+            sendResponse(fd: clientFD, success: false, message: "invalid json")
             return
         }
         // Token check
         if req.token != expectedToken {
             fputs("[helper] token mismatch\n", stderr)
-            let resp = ApplyResponse(success: false, message: "token mismatch")
-            if let respData = try? JSONEncoder().encode(resp) { _ = writeFrame(fd: clientFD, data: respData) }
+            sendResponse(fd: clientFD, success: false, message: "token mismatch")
             return
         }
-        // Exit command
+        // Exit command (restores cap via cleanupAndExit)
         if req.op == "exit" {
-            let resp = ApplyResponse(success: true, message: "bye")
-            if let respData = try? JSONEncoder().encode(resp) { _ = writeFrame(fd: clientFD, data: respData) }
+            sendResponse(fd: clientFD, success: true, message: "bye")
             fputs("[helper] exit requested\n", stderr)
             cleanupAndExit(0)
         }
-        // Apply flow
-        fputs("[helper] apply turbo=\(String(describing:req.turbo)) power=\(String(describing:req.powerLimit)) fan=\(String(describing:req.fanSpeed)) lpm=\(String(describing:req.lowPowerMode))\n", stderr)
-        // Ensure secure dir again
-        if !ensureSecureDir() {
-            let resp = ApplyResponse(success: false, message: "secure dir setup failed")
-            if let d = try? JSONEncoder().encode(resp) { _ = writeFrame(fd: clientFD, data: d) }
+        // Status read (no writes)
+        if req.op == "status" {
+            let probe = agxService()
+            if probe == 0 {
+                sendResponse(fd: clientFD, success: false, message: "no AGX GPU found")
+            } else {
+                IOObjectRelease(probe)
+                sendResponse(fd: clientFD, success: true, message: "ok")
+            }
             return
         }
-        var success = true
-        var messages: [String] = []
-        if let turbo = req.turbo {
-            let ok = setTurbo(enable: turbo)
-            success = success && ok
-            messages.append("turbo=\(ok)")
+        // Restore default cap
+        if req.op == "restore" {
+            if restoreDefaultCap() {
+                sendResponse(fd: clientFD, success: true, message: "restored \(kDefaultMaxMW) mW")
+            } else {
+                sendResponse(fd: clientFD, success: false, message: "restore failed (no AGX GPU?)")
+            }
+            return
         }
-        if let pl = req.powerLimit, pl > 0 {
-            let ok = setPowerLimit(plWatts: Int(pl))
-            success = success && ok
-            messages.append("power=\(ok)")
+        // Apply a new cap
+        guard let mw = req.gpuCapMW else {
+            sendResponse(fd: clientFD, success: false, message: "missing gpuCapMW")
+            return
         }
-        if let fan = req.fanSpeed {
-            let ok = setFan(rpm: Int(fan))
-            success = success && ok
-            messages.append("fan=\(ok)")
+        fputs("[helper] apply gpuCap=\(mw) mW\n", stderr)
+        if mw < kMinCapMW || mw > kDefaultMaxMW {
+            sendResponse(fd: clientFD, success: false,
+                         message: "cap must be \(kMinCapMW)...\(kDefaultMaxMW) mW")
+            return
         }
-        if let lpm = req.lowPowerMode {
-            let ok = setLowPowerMode(lpm)
-            success = success && ok
-            messages.append("lpm=\(ok)")
+        let kr = agxSetCapMW(mw)
+        if kr != KERN_SUCCESS {
+            sendResponse(fd: clientFD, success: false,
+                         message: "AGX write failed 0x\(String(kr, radix: 16))")
+            return
         }
-        let resp = ApplyResponse(success: success, message: messages.joined(separator: ", "))
-        if let respData = try? JSONEncoder().encode(resp) {
-            _ = writeFrame(fd: clientFD, data: respData)
+        // Verify the firmware took it.
+        if let back = agxCurrentMaxMW(), back != mw {
+            sendResponse(fd: clientFD, success: false,
+                         message: "verify mismatch: wrote \(mw) mW, reads \(back) mW")
+            return
         }
-        fputs("[helper] done success=\(success)\n", stderr)
+        sendResponse(fd: clientFD, success: true, message: "capped \(mw) mW")
     }
 }

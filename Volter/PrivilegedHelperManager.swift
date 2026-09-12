@@ -185,38 +185,68 @@ final class PrivilegedHelperManager {
     
     struct HelperRequest: Codable {
         let token: String
-        let turbo: Bool?
-        let powerLimit: Double?
-        let lowPowerMode: String?
-        let fanSpeed: Double?
+        let gpuCapMW: Int64?
         let op: String?
     }
     struct HelperResponse: Codable {
         let success: Bool
         let message: String
+        let origMaxMW: Int64?
+        let maxCapMW: Int64?
     }
-    
-    func apply(turbo: Bool, powerLimit: Double, lowPowerMode: String, fanSpeed: Double) -> Bool {
-        let ok = ensureHelper()
-        if !ok { return false }
-        let req = HelperRequest(token: token, turbo: turbo, powerLimit: powerLimit, lowPowerMode: lowPowerMode, fanSpeed: fanSpeed, op: nil)
-        guard let reqData = try? JSONEncoder().encode(req) else { return false }
-        return send(reqData: reqData)
+
+    struct GPUStatus {
+        let origMaxMW: Int64
+        let maxCapMW: Int64
+    }
+
+    /// Read current GPU state (no writes). Spawns the helper on first call.
+    func status() -> GPUStatus? {
+        guard let resp = sendRequest(gpuCapMW: nil, op: "status"), resp.success,
+              let orig = resp.origMaxMW, let max = resp.maxCapMW else {
+            return nil
+        }
+        return GPUStatus(origMaxMW: orig, maxCapMW: max)
+    }
+
+    /// Cap the GPU to mW (must be within 1000...machine default). Returns live readings on success.
+    func applyCap(mW: Int64) -> GPUStatus? {
+        guard let resp = sendRequest(gpuCapMW: mW, op: nil), resp.success,
+              let orig = resp.origMaxMW, let max = resp.maxCapMW else {
+            return nil
+        }
+        return GPUStatus(origMaxMW: orig, maxCapMW: max)
+    }
+
+    /// Restore the machine default cap ("max").
+    func restoreMax() -> GPUStatus? {
+        guard let resp = sendRequest(gpuCapMW: nil, op: "restore"), resp.success,
+              let orig = resp.origMaxMW, let max = resp.maxCapMW else {
+            return nil
+        }
+        return GPUStatus(origMaxMW: orig, maxCapMW: max)
+    }
+
+    private func sendRequest(gpuCapMW: Int64?, op: String?, timeout: TimeInterval = 10) -> HelperResponse? {
+        if !ensureHelper() { return nil }
+        let req = HelperRequest(token: token, gpuCapMW: gpuCapMW, op: op)
+        guard let reqData = try? JSONEncoder().encode(req) else { return nil }
+        return send(reqData: reqData, timeout: timeout)
     }
     
     func terminateHelper() {
-        // Best-effort send exit command; helper also exits when ppid dies
-        let req = HelperRequest(token: token, turbo: nil, powerLimit: nil, lowPowerMode: nil, fanSpeed: nil, op: "exit")
-        if let data = try? JSONEncoder().encode(req), canConnect() {
-            _ = send(reqData: data, timeout: 1.0)
+        // Best-effort restore + exit; helper also restores when ppid dies
+        if canConnect() {
+            _ = sendRequest(gpuCapMW: nil, op: "restore", timeout: 3.0)
+            _ = sendRequest(gpuCapMW: nil, op: "exit", timeout: 1.0)
         }
         // Clean stale socket file (helper will also unlink)
         try? FileManager.default.removeItem(atPath: socketPath)
     }
-    
-    private func send(reqData: Data, timeout: TimeInterval = 10) -> Bool {
+
+    private func send(reqData: Data, timeout: TimeInterval = 10) -> HelperResponse? {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        if fd < 0 { return false }
+        if fd < 0 { return nil }
         defer { close(fd) }
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -228,24 +258,27 @@ final class PrivilegedHelperManager {
         }
         if ret != 0 {
             print("[Volter] connect failed \(String(cString: strerror(errno)))")
-            return false
+            return nil
         }
         var tv = timeval(tv_sec: Int(timeout), tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         if !writeFrame(fd: fd, data: reqData) {
             print("[Volter] writeFrame failed")
-            return false
+            return nil
         }
         guard let respData = readFrame(fd: fd) else {
             print("[Volter] readFrame failed")
-            return false
+            return nil
         }
         guard let resp = try? JSONDecoder().decode(HelperResponse.self, from: respData) else {
             print("[Volter] decode response failed \(String(data: respData, encoding: .utf8) ?? "")")
-            return false
+            return nil
         }
-        return resp.success
+        if !resp.success {
+            print("[Volter] helper error: \(resp.message)")
+        }
+        return resp
     }
     
     // For debugging

@@ -33,7 +33,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Setup popover window (Matching ContentView’s 114pt height constraint)
         let popover = NSPopover()
-        popover.contentSize = NSSize(width: 290, height: 114)
+        popover.contentSize = NSSize(width: 290, height: 90)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: ContentView())
         self.popover = popover
