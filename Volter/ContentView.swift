@@ -24,6 +24,17 @@ struct ContentView: View {
     @State private var baseStealth = false
     @State private var powerError: String? = nil
 
+    private let horizontalPadding: CGFloat = 16
+    private let powerLabelWidth: CGFloat = 56
+    private let powerReadoutWidth: CGFloat = 50
+    private let switchColumnWidth: CGFloat = 32
+    private let rowHeight: CGFloat = 22
+    private let controlHeight: CGFloat = 18
+
+    private var contentWidth: CGFloat { 290 - horizontalPadding * 2 }
+    private var sliderWidth: CGFloat { contentWidth - powerLabelWidth - powerReadoutWidth }
+    private var headerControlsWidth: CGFloat { powerLabelWidth + sliderWidth }
+
     /// Hard "Max" (100W): reaching 28W on the slider snaps to restore.
     /// Visible track ends at 20W; dragging past it accumulates invisibly to 28W.
     private var sliderMax: Double { PowerManager.snapToMaxWatts }
@@ -43,7 +54,7 @@ struct ContentView: View {
         ZStack(alignment: .topLeading) {
             
             // 1. Static Header Row: Explicitly sized to 290px to lock all elements in place
-            HStack(alignment: .center) {
+            HStack(spacing: 0) {
                 // Main view exposes the sleep policy; settings keeps the title.
                 if showingSettings {
                     Text("Volter")
@@ -74,7 +85,7 @@ struct ContentView: View {
                         if isApplying {
                             ProgressView()
                                 .progressViewStyle(.circular)
-                                .scaleEffect(0.5)
+                                .controlSize(.small)
                                 .frame(width: 20, height: 20)
                         } else if showingSettings {
                             // Close settings
@@ -108,7 +119,7 @@ struct ContentView: View {
                 .animation(.easeInOut(duration: 0.2), value: hasPendingChanges)
                 .animation(.easeInOut(duration: 0.25), value: showingSettings)
             }
-            .padding(.horizontal, 16)
+            .padding(.horizontal, horizontalPadding)
             .frame(width: 290, height: 24)
             .padding(.top, 12)
             
@@ -141,20 +152,31 @@ struct ContentView: View {
     }
     
     private var powerHeaderControls: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 0) {
             Toggle(
-                "Disable Sleep",
+                "",
                 isOn: Binding(
                     get: { disableSleep },
                     set: { setPendingDisableSleep($0) }
                 )
             )
+            .labelsHidden()
             .toggleStyle(.switch)
             .controlSize(.mini)
-            .font(.body)
-            .frame(height: 22)
+            .frame(width: switchColumnWidth, height: controlHeight, alignment: .leading)
+            .accessibilityLabel("Disable sleep")
             .disabled(isApplying)
             .help("Prevents system sleep, including when the lid is closed")
+
+            // Leave the label column aligned with the slider's leading edge.
+            Color.clear
+                .frame(width: powerLabelWidth - switchColumnWidth, height: controlHeight)
+
+            Text("Disable sleep")
+                .font(.body)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .frame(height: controlHeight, alignment: .leading)
 
             if disableSleep {
                 Button {
@@ -163,19 +185,25 @@ struct ContentView: View {
                     Text("Stealth")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(stealth ? Color.white : Color.primary)
-                        .frame(width: 62, height: 22)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: controlHeight)
                         .background(
                             stealth ? Color.accentColor : Color(NSColor.controlColor)
                         )
                         .clipShape(Capsule())
                 }
                 .buttonStyle(.plain)
+                .padding(.leading, 8)
+                .frame(maxWidth: .infinity)
+                .frame(height: controlHeight)
+                .clipped()
+                .layoutPriority(1)
                 .disabled(isApplying)
                 .help("When enabled, sleep as soon as the lid opens")
                 .transition(.opacity.combined(with: .scale))
             }
         }
-        .fixedSize(horizontal: true, vertical: false)
+        .frame(width: headerControlsWidth, height: rowHeight, alignment: .leading)
         .help(powerError ?? "Disable sleep, then optionally enable Stealth")
     }
 
@@ -184,32 +212,42 @@ struct ContentView: View {
         Group {
             if defaultMaxWatts != nil {
                 // GPU cap slider (far left = Auto, far right = Max/restore)
-                HStack(alignment: .center) {
+                HStack(spacing: 0) {
                     Text("Power:")
                         .font(.body)
                         .lineLimit(1)
                         .fixedSize(horizontal: true, vertical: false)
-                        .frame(width: 88, alignment: .leading)
+                        .frame(width: powerLabelWidth, height: rowHeight, alignment: .leading)
 
                     CustomTickSlider(value: $gpuCap, range: 0...sliderMax,
                                      physicalMax: trackMax, tickCount: 25, stepSize: 1.0)
+                        .frame(width: sliderWidth, height: 24)
 
                     // Static Readout Label (mirrors the old fan Auto pattern)
                     Text(gpuCap <= 0.001 ? "Auto" : (isAtMax ? "Max" : String(format: "%gW", gpuCap)))
-                        .font(.body)
+                        .font(.system(size: 12))
+                        .lineLimit(1)
                         .multilineTextAlignment(.trailing)
-                        .frame(width: 55, height: 20, alignment: .trailing)
+                        .frame(width: powerReadoutWidth, height: rowHeight, alignment: .trailing)
                 }
                 .frame(height: 24)
-                .padding(.horizontal, 16)
+                .padding(.horizontal, horizontalPadding)
             } else {
-                HStack {
-                    Spacer()
-                    ProgressView()
-                        .scaleEffect(0.7)
-                    Spacer()
+                // Keep the initial layout stable while the first status read completes.
+                HStack(spacing: 0) {
+                    Color.clear
+                        .frame(width: powerLabelWidth, height: rowHeight)
+                    ZStack {
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                            .controlSize(.small)
+                    }
+                    .frame(width: sliderWidth, height: rowHeight)
+                    Color.clear
+                        .frame(width: powerReadoutWidth, height: rowHeight)
                 }
-                .padding(.horizontal, 16)
+                .frame(height: 24)
+                .padding(.horizontal, horizontalPadding)
             }
         }
     }
