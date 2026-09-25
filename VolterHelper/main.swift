@@ -14,7 +14,9 @@
 //
 
 import Foundation
+import Dispatch
 import IOKit
+import IOKit.pwr_mgt
 import Darwin
 
 // MARK: - AGX GPU Interface
@@ -79,7 +81,8 @@ func agxSetCapMW(_ mw: Int64) -> kern_return_t {
 struct ApplyRequest: Codable {
     let token: String
     let gpuCapMW: Int64?
-    let op: String? // "status" | "restore" | "exit" | nil = apply cap
+    let op: String? // "status" | "restore" | "setDisableSleep" | "setStealth" | "exit" | nil = apply cap
+    let enabled: Bool?
 }
 
 struct ApplyResponse: Codable {
@@ -87,7 +90,295 @@ struct ApplyResponse: Codable {
     let message: String
     let origMaxMW: Int64?
     let maxCapMW: Int64?
+    let sleepDisabled: Bool?
+    let stealthEnabled: Bool?
 }
+
+// MARK: - Power policy
+
+private let clamshellMessageID: UInt32 = 0xe003_4100
+
+func readSleepDisabled() -> Bool? {
+    let service = IOServiceGetMatchingService(
+        kIOMainPortDefault,
+        IOServiceNameMatching("IOPMrootDomain")
+    )
+    guard service != IO_OBJECT_NULL else { return nil }
+    defer { IOObjectRelease(service) }
+
+    guard let unmanaged = IORegistryEntryCreateCFProperty(
+        service,
+        "SleepDisabled" as CFString,
+        kCFAllocatorDefault,
+        0
+    ) else { return nil }
+
+    let value = unmanaged.takeRetainedValue()
+    guard CFGetTypeID(value) == CFBooleanGetTypeID() else { return nil }
+    return CFBooleanGetValue(value as! CFBoolean)
+}
+
+func readClamshellClosed() -> Bool? {
+    let service = IOServiceGetMatchingService(
+        kIOMainPortDefault,
+        IOServiceNameMatching("IOPMrootDomain")
+    )
+    guard service != IO_OBJECT_NULL else { return nil }
+    defer { IOObjectRelease(service) }
+
+    guard let unmanaged = IORegistryEntryCreateCFProperty(
+        service,
+        "AppleClamshellState" as CFString,
+        kCFAllocatorDefault,
+        0
+    ) else { return nil }
+
+    let value = unmanaged.takeRetainedValue()
+    guard CFGetTypeID(value) == CFBooleanGetTypeID() else { return nil }
+    return CFBooleanGetValue(value as! CFBoolean)
+}
+
+func runPmset(_ arguments: [String]) -> String? {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+    process.arguments = arguments
+
+    let output = Pipe()
+    process.standardOutput = output
+    process.standardError = output
+
+    do {
+        try process.run()
+    } catch {
+        return "failed to launch pmset: \(error.localizedDescription)"
+    }
+
+    let data = output.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+
+    guard process.terminationStatus == 0 else {
+        let text = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return text.isEmpty ? "pmset exited with status \(process.terminationStatus)" : text
+    }
+    return nil
+}
+
+final class PowerPolicyController {
+    struct Status {
+        let disableSleep: Bool
+        let stealth: Bool
+    }
+
+    private let lock = NSLock()
+    private var disableSleepEnabled: Bool
+    private var stealthEnabled = false
+    private var ownsSleepDisabled = false
+    private var clamshellObserverAvailable = false
+    private var lastLidClosed: Bool?
+
+    init() {
+        disableSleepEnabled = readSleepDisabled() ?? false
+    }
+
+    func status() -> Status {
+        lock.lock()
+        defer { lock.unlock() }
+        if let actual = readSleepDisabled(), actual != disableSleepEnabled {
+            disableSleepEnabled = actual
+            if !actual { stealthEnabled = false }
+        }
+        return Status(
+            disableSleep: disableSleepEnabled,
+            stealth: stealthEnabled && disableSleepEnabled
+        )
+    }
+
+    func setDisableSleep(_ enabled: Bool) -> (Status, String?) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if enabled {
+            guard let wasAlreadyDisabled = readSleepDisabled() else {
+                return (statusLocked(), "Unable to read SleepDisabled")
+            }
+            if !wasAlreadyDisabled {
+                if let error = runPmset(["-a", "disablesleep", "1"]) {
+                    return (statusLocked(), error)
+                }
+            }
+            guard readSleepDisabled() == true else {
+                return (statusLocked(), "SleepDisabled did not become true")
+            }
+            disableSleepEnabled = true
+            if !wasAlreadyDisabled { ownsSleepDisabled = true }
+        } else {
+            stealthEnabled = false
+            if readSleepDisabled() == false {
+                disableSleepEnabled = false
+                ownsSleepDisabled = false
+                return (statusLocked(), nil)
+            }
+            if let error = runPmset(["-a", "disablesleep", "0"]) {
+                return (statusLocked(), error)
+            }
+            guard readSleepDisabled() == false else {
+                return (statusLocked(), "SleepDisabled did not become false")
+            }
+            disableSleepEnabled = false
+            ownsSleepDisabled = false
+        }
+        return (statusLocked(), nil)
+    }
+
+    func setClamshellObserverAvailable(_ available: Bool) {
+        lock.lock()
+        clamshellObserverAvailable = available
+        if !available { stealthEnabled = false }
+        lock.unlock()
+    }
+
+    func setStealth(_ enabled: Bool) -> (Status, String?) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if enabled {
+            guard clamshellObserverAvailable else {
+                stealthEnabled = false
+                return (statusLocked(), "Clamshell monitoring is unavailable")
+            }
+            guard disableSleepEnabled, readSleepDisabled() == true else {
+                stealthEnabled = false
+                return (statusLocked(), "Disable Sleep must be enabled first")
+            }
+        }
+        stealthEnabled = enabled
+        return (statusLocked(), nil)
+    }
+
+    func primeClamshellState(_ closed: Bool) {
+        lock.lock()
+        lastLidClosed = closed
+        lock.unlock()
+    }
+
+    func handleClamshellClosed(_ closed: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let wasClosed = lastLidClosed ?? false
+        lastLidClosed = closed
+        guard !closed, wasClosed, disableSleepEnabled, stealthEnabled else { return }
+
+        if let error = runPmset(["-a", "disablesleep", "0"]) {
+            fputs("[helper] stealth failed to re-enable sleep: \(error)\n", stderr)
+            return
+        }
+        guard readSleepDisabled() == false else {
+            fputs("[helper] stealth could not verify sleep re-enabled\n", stderr)
+            return
+        }
+
+        disableSleepEnabled = false
+        stealthEnabled = false
+        ownsSleepDisabled = false
+
+        if let error = runPmset(["sleepnow"]) {
+            fputs("[helper] stealth sleepnow failed: \(error)\n", stderr)
+        } else {
+            fputs("[helper] stealth sleep requested after lid opened\n", stderr)
+        }
+    }
+
+    func cleanup() {
+        lock.lock()
+        defer { lock.unlock() }
+
+        stealthEnabled = false
+        if ownsSleepDisabled {
+            if let error = runPmset(["-a", "disablesleep", "0"]) {
+                fputs("[helper] cleanup failed to re-enable sleep: \(error)\n", stderr)
+            }
+        }
+        ownsSleepDisabled = false
+        disableSleepEnabled = readSleepDisabled() ?? false
+    }
+
+    private func statusLocked() -> Status {
+        Status(
+            disableSleep: disableSleepEnabled,
+            stealth: stealthEnabled && disableSleepEnabled
+        )
+    }
+}
+
+final class ClamshellObserver {
+    private let policy: PowerPolicyController
+    private let queue = DispatchQueue(label: "VolterHelper.Clamshell", qos: .userInitiated)
+    private var port: OpaquePointer?
+    private var notification: io_object_t = IO_OBJECT_NULL
+
+    private let callback: IOServiceInterestCallback = { refCon, _, messageType, messageArgument in
+        guard messageType == clamshellMessageID, let refCon else { return }
+        let observer = Unmanaged<ClamshellObserver>
+            .fromOpaque(refCon)
+            .takeUnretainedValue()
+        let bits = messageArgument.map { UInt(bitPattern: $0) } ?? 0
+        observer.policy.handleClamshellClosed(
+            (bits & UInt(kClamshellStateBit)) != 0
+        )
+    }
+
+    init(policy: PowerPolicyController) {
+        self.policy = policy
+    }
+
+    func start() -> IOReturn {
+        guard port == nil else { return KERN_ALREADY_IN_SET }
+        guard let port = IONotificationPortCreate(kIOMainPortDefault) else {
+            return kIOReturnNoMemory
+        }
+        self.port = port
+        IONotificationPortSetDispatchQueue(port, queue)
+
+        let root = IOServiceGetMatchingService(
+            kIOMainPortDefault,
+            IOServiceMatching("IOPMrootDomain")
+        )
+        guard root != IO_OBJECT_NULL else {
+            IONotificationPortDestroy(port)
+            self.port = nil
+            return kIOReturnNotFound
+        }
+        defer { IOObjectRelease(root) }
+
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        let result = IOServiceAddInterestNotification(
+            port,
+            root,
+            kIOGeneralInterest,
+            callback,
+            context,
+            &notification
+        )
+        if result != KERN_SUCCESS {
+            IONotificationPortDestroy(port)
+            self.port = nil
+            return result
+        }
+
+        // Register first, then take one snapshot on the same delivery queue.
+        queue.sync {
+            if let initialClosed = readClamshellClosed() {
+                self.policy.primeClamshellState(initialClosed)
+            }
+        }
+        return result
+    }
+}
+
+let powerPolicy = PowerPolicyController()
+let clamshellObserver = ClamshellObserver(policy: powerPolicy)
 
 // MARK: - Socket helpers
 
@@ -140,11 +431,14 @@ func readFrame(fd: Int32) -> Data? {
 }
 
 func sendResponse(fd: Int32, success: Bool, message: String) {
+    let power = powerPolicy.status()
     let resp = ApplyResponse(
         success: success,
         message: message,
         origMaxMW: kDefaultMaxMW,
-        maxCapMW: agxCurrentMaxMW()
+        maxCapMW: agxCurrentMaxMW(),
+        sleepDisabled: power.disableSleep,
+        stealthEnabled: power.stealth
     )
     if let data = try? JSONEncoder().encode(resp) {
         _ = writeFrame(fd: fd, data: data)
@@ -188,6 +482,7 @@ if ppid == 0 { ppid = getppid() }
 // (A live read while capped returns the cap, not the default — never trust it.)
 // Slightly above real defaults (M5 Pro ~99.3W); firmware treats it as uncapped.
 let kDefaultMaxMW: Int64 = 100_000
+var gpuCapChangedByVolter = false
 
 do {
     let probe = agxService()
@@ -208,8 +503,11 @@ func restoreDefaultCap() -> Bool {
 // Setup signal handler to clean up socket
 var globalSocketPathForCleanup = sockPath
 func cleanupAndExit(_ code: Int32) -> Never {
-    // Never leave the user stuck capped: restore first, then unlink.
-    _ = restoreDefaultCap()
+    // Restore every Volter-owned policy before removing the helper endpoint.
+    powerPolicy.cleanup()
+    if gpuCapChangedByVolter {
+        _ = restoreDefaultCap()
+    }
     unlink(globalSocketPathForCleanup)
     // Try to remove parent dir if empty and is our volter-xxx dir
     let dir = (globalSocketPathForCleanup as NSString).deletingLastPathComponent
@@ -270,6 +568,12 @@ if chmod(sockPath, 0o666) != 0 { perror("chmod") } // 0666 so user can connect (
 if listen(listenFD, 5) != 0 { perror("listen"); close(listenFD); exit(1) }
 
 fputs("[helper] listening on \(sockPath) ppid=\(ppid) token=\(expectedToken.prefix(6))***\n", stderr)
+
+let clamshellResult = clamshellObserver.start()
+powerPolicy.setClamshellObserverAvailable(clamshellResult == KERN_SUCCESS)
+if clamshellResult != KERN_SUCCESS {
+    fputs("[helper] clamshell observer unavailable: 0x\(String(clamshellResult, radix: 16))\n", stderr)
+}
 
 // Parent watchdog - exit when parent dies (cleanupAndExit restores the cap first)
 DispatchQueue.global(qos: .background).async {
@@ -337,16 +641,57 @@ while true {
             }
             return
         }
+        // Disable Sleep policy
+        if req.op == "setDisableSleep" {
+            guard let enabled = req.enabled else {
+                sendResponse(fd: clientFD, success: false, message: "missing enabled")
+                return
+            }
+            let (status, error) = powerPolicy.setDisableSleep(enabled)
+            if let error {
+                sendResponse(fd: clientFD, success: false, message: error)
+            } else {
+                sendResponse(
+                    fd: clientFD,
+                    success: true,
+                    message: status.disableSleep ? "sleep disabled" : "sleep enabled"
+                )
+            }
+            return
+        }
+        // Stealth auto-sleep on lid reopen
+        if req.op == "setStealth" {
+            guard let enabled = req.enabled else {
+                sendResponse(fd: clientFD, success: false, message: "missing enabled")
+                return
+            }
+            let (_, error) = powerPolicy.setStealth(enabled)
+            if let error {
+                sendResponse(fd: clientFD, success: false, message: error)
+            } else {
+                sendResponse(
+                    fd: clientFD,
+                    success: true,
+                    message: enabled ? "stealth enabled" : "stealth disabled"
+                )
+            }
+            return
+        }
         // Restore default cap
         if req.op == "restore" {
             if restoreDefaultCap() {
+                gpuCapChangedByVolter = false
                 sendResponse(fd: clientFD, success: true, message: "restored \(kDefaultMaxMW) mW")
             } else {
                 sendResponse(fd: clientFD, success: false, message: "restore failed (no AGX GPU?)")
             }
             return
         }
-        // Apply a new cap
+        // Apply a new cap only when no named operation was requested.
+        if req.op != nil {
+            sendResponse(fd: clientFD, success: false, message: "unknown operation")
+            return
+        }
         guard let mw = req.gpuCapMW else {
             sendResponse(fd: clientFD, success: false, message: "missing gpuCapMW")
             return
@@ -369,6 +714,7 @@ while true {
                          message: "verify mismatch: wrote \(mw) mW, reads \(back) mW")
             return
         }
+        gpuCapChangedByVolter = true
         sendResponse(fd: clientFD, success: true, message: "capped \(mw) mW")
     }
 }

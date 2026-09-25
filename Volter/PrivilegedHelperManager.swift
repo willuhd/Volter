@@ -187,17 +187,25 @@ final class PrivilegedHelperManager {
         let token: String
         let gpuCapMW: Int64?
         let op: String?
+        let enabled: Bool?
     }
     struct HelperResponse: Codable {
         let success: Bool
         let message: String
         let origMaxMW: Int64?
         let maxCapMW: Int64?
+        let sleepDisabled: Bool?
+        let stealthEnabled: Bool?
     }
 
     struct GPUStatus {
         let origMaxMW: Int64
         let maxCapMW: Int64
+    }
+
+    struct PowerPolicyStatus {
+        let sleepDisabled: Bool
+        let stealthEnabled: Bool
     }
 
     /// Read current GPU state (no writes). Spawns the helper on first call.
@@ -227,17 +235,52 @@ final class PrivilegedHelperManager {
         return GPUStatus(origMaxMW: orig, maxCapMW: max)
     }
 
-    private func sendRequest(gpuCapMW: Int64?, op: String?, timeout: TimeInterval = 10) -> HelperResponse? {
-        if !ensureHelper() { return nil }
-        let req = HelperRequest(token: token, gpuCapMW: gpuCapMW, op: op)
+    func setDisableSleep(_ enabled: Bool) -> PowerPolicyStatus? {
+        guard let resp = sendRequest(op: "setDisableSleep", enabled: enabled),
+              resp.success,
+              let sleepDisabled = resp.sleepDisabled,
+              let stealthEnabled = resp.stealthEnabled else {
+            return nil
+        }
+        return PowerPolicyStatus(
+            sleepDisabled: sleepDisabled,
+            stealthEnabled: stealthEnabled
+        )
+    }
+
+    func setStealth(_ enabled: Bool) -> PowerPolicyStatus? {
+        guard let resp = sendRequest(op: "setStealth", enabled: enabled),
+              resp.success,
+              let sleepDisabled = resp.sleepDisabled,
+              let stealthEnabled = resp.stealthEnabled else {
+            return nil
+        }
+        return PowerPolicyStatus(
+            sleepDisabled: sleepDisabled,
+            stealthEnabled: stealthEnabled
+        )
+    }
+
+    private func sendRequest(
+        gpuCapMW: Int64? = nil,
+        op: String? = nil,
+        enabled: Bool? = nil,
+        timeout: TimeInterval = 10
+    ) -> HelperResponse? {
+        guard ensureHelper() else { return nil }
+        let req = HelperRequest(
+            token: token,
+            gpuCapMW: gpuCapMW,
+            op: op,
+            enabled: enabled
+        )
         guard let reqData = try? JSONEncoder().encode(req) else { return nil }
         return send(reqData: reqData, timeout: timeout)
     }
     
     func terminateHelper() {
-        // Best-effort restore + exit; helper also restores when ppid dies
+        // Best-effort exit; helper restores Volter-owned state and unlinks socket.
         if canConnect() {
-            _ = sendRequest(gpuCapMW: nil, op: "restore", timeout: 3.0)
             _ = sendRequest(gpuCapMW: nil, op: "exit", timeout: 1.0)
         }
         // Clean stale socket file (helper will also unlink)

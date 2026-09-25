@@ -9,7 +9,6 @@
 
 import Foundation
 import IOKit
-import Darwin
 
 class PowerManager {
     static let shared = PowerManager()
@@ -22,6 +21,11 @@ class PowerManager {
         let capWatts: Double
     }
 
+    struct PowerPolicyStatus {
+        let disableSleep: Bool
+        let stealth: Bool
+    }
+
     /// Hard "Max": 100W on all Apple Silicon (mirrors the helper's kDefaultMaxMW).
     /// Reaching this on the slider snaps to restore instead of writing.
     static let snapToMaxWatts = 28.0
@@ -32,22 +36,6 @@ class PowerManager {
             defaultMaxWatts: Double(origMW) / 1000.0,
             capWatts: Double(maxMW) / 1000.0
         )
-    }
-
-    // MARK: - Chip label (sudoless sysctl)
-
-    static func chipName() -> String {
-        var size = 0
-        guard sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0) == 0, size > 0 else {
-            return "Volter"
-        }
-        var buf = [CChar](repeating: 0, count: size)
-        guard sysctlbyname("machdep.cpu.brand_string", &buf, &size, nil, 0) == 0 else {
-            return "Volter"
-        }
-        let full = String(cString: buf) // e.g. "Apple M5 Pro"
-        let short = full.replacingOccurrences(of: "Apple ", with: "")
-        return short.isEmpty ? "Volter" : short
     }
 
     // MARK: - Sudoless direct AGX read (display path, no password)
@@ -69,6 +57,55 @@ class PowerManager {
             return value
         }
         return nil
+    }
+
+    /// Reads the system-wide sleep override directly from IOPMrootDomain.
+    func readDisableSleep() -> Bool? {
+        let svc = IOServiceGetMatchingService(
+            kIOMainPortDefault,
+            IOServiceNameMatching("IOPMrootDomain")
+        )
+        guard svc != 0 else { return nil }
+        defer { IOObjectRelease(svc) }
+
+        guard let unmanaged = IORegistryEntryCreateCFProperty(
+            svc,
+            "SleepDisabled" as CFString,
+            kCFAllocatorDefault,
+            0
+        ) else { return nil }
+
+        let value = unmanaged.takeRetainedValue()
+        guard CFGetTypeID(value) == CFBooleanGetTypeID() else { return nil }
+        return CFBooleanGetValue(value as! CFBoolean)
+    }
+
+    func setDisableSleep(_ enabled: Bool) -> PowerPolicyStatus? {
+        // Avoid launching/authenticating the helper when the requested state
+        // is already the live system state.
+        if !enabled && readDisableSleep() == false {
+            return PowerPolicyStatus(disableSleep: false, stealth: false)
+        }
+        guard let status = PrivilegedHelperManager.shared.setDisableSleep(enabled) else {
+            return nil
+        }
+        return PowerPolicyStatus(
+            disableSleep: status.sleepDisabled,
+            stealth: status.stealthEnabled
+        )
+    }
+
+    func setStealth(_ enabled: Bool) -> PowerPolicyStatus? {
+        if !enabled && readDisableSleep() == false {
+            return PowerPolicyStatus(disableSleep: false, stealth: false)
+        }
+        guard let status = PrivilegedHelperManager.shared.setStealth(enabled) else {
+            return nil
+        }
+        return PowerPolicyStatus(
+            disableSleep: status.sleepDisabled,
+            stealth: status.stealthEnabled
+        )
     }
 
     /// Read current GPU state. Tries sudoless direct read first (no password);

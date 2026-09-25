@@ -7,6 +7,7 @@
 
 import SwiftUI
 import AppKit
+import Combine
 
 struct ContentView: View {
     // GPU cap in watts. 0 = Auto (uncapped). defaultMaxWatts is nil until the first helper read.
@@ -17,9 +18,11 @@ struct ContentView: View {
     @State private var showingSettings = false
     @State private var isApplying = false // Tracking backend execution state
     @State private var hasPendingChanges = false // sticky flag: true after first edit until next Apply (even if you revert sliders)
-
-    /// Chip marketing name, read once (sudoless sysctl, e.g. "M5 Pro").
-    private static let chipLabel: String = PowerManager.chipName()
+    @State private var disableSleep = false
+    @State private var stealth = false
+    @State private var baseDisableSleep = false
+    @State private var baseStealth = false
+    @State private var powerError: String? = nil
 
     /// Hard "Max" (100W): reaching 28W on the slider snaps to restore.
     /// Visible track ends at 20W; dragging past it accumulates invisibly to 28W.
@@ -31,23 +34,24 @@ struct ContentView: View {
     private var hasChanges: Bool {
         defaultMaxWatts != nil && abs(gpuCap - baseGpuCap) > 0.001
     }
+
+    private var hasPowerChanges: Bool {
+        disableSleep != baseDisableSleep || stealth != baseStealth
+    }
     
     var body: some View {
         ZStack(alignment: .topLeading) {
             
             // 1. Static Header Row: Explicitly sized to 290px to lock all elements in place
             HStack(alignment: .center) {
-                // Left Title (Cross-fade transition)
-                ZStack(alignment: .leading) {
-                    if !showingSettings {
-                        Text(Self.chipLabel)
-                            .font(.headline)
-                            .transition(.opacity)
-                    } else {
-                        Text("Volter")
-                            .font(.system(size: 16, weight: .bold))
-                            .transition(.opacity)
-                    }
+                // Main view exposes the sleep policy; settings keeps the title.
+                if showingSettings {
+                    Text("Volter")
+                        .font(.system(size: 16, weight: .bold))
+                        .transition(.opacity)
+                } else {
+                    powerHeaderControls
+                        .transition(.opacity)
                 }
                 
                 Spacer()
@@ -128,10 +132,53 @@ struct ContentView: View {
         }
         .onChange(of: gpuCap) { _, _ in if hasChanges { hasPendingChanges = true } }
         .task {
+            refreshPowerPolicy()
             refreshFromHelper()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWorkspace.didWakeNotification)) { _ in
+            refreshPowerPolicy()
         }
     }
     
+    private var powerHeaderControls: some View {
+        HStack(spacing: 8) {
+            Toggle(
+                "Disable Sleep",
+                isOn: Binding(
+                    get: { disableSleep },
+                    set: { setPendingDisableSleep($0) }
+                )
+            )
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .font(.body)
+            .frame(height: 22)
+            .disabled(isApplying)
+            .help("Prevents system sleep, including when the lid is closed")
+
+            if disableSleep {
+                Button {
+                    setPendingStealth(!stealth)
+                } label: {
+                    Text("Stealth")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(stealth ? Color.white : Color.primary)
+                        .frame(width: 62, height: 22)
+                        .background(
+                            stealth ? Color.accentColor : Color(NSColor.controlColor)
+                        )
+                        .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .disabled(isApplying)
+                .help("When enabled, sleep as soon as the lid opens")
+                .transition(.opacity.combined(with: .scale))
+            }
+        }
+        .fixedSize(horizontal: true, vertical: false)
+        .help(powerError ?? "Disable sleep, then optionally enable Stealth")
+    }
+
     // MARK: - Main Panel View
     private var mainBody: some View {
         Group {
@@ -200,36 +247,100 @@ struct ContentView: View {
                     gpuCap = s.capWatts
                 }
                 baseGpuCap = gpuCap
-                hasPendingChanges = false
+                if !hasPowerChanges { hasPendingChanges = false }
             }
         }
     }
 
-    private func applyChanges() {
-        // Prevent concurrent execution queueing
-        guard !isApplying else { return }
-        guard defaultMaxWatts != nil else { return }
-        isApplying = true
+    private func refreshPowerPolicy() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let actual = PowerManager.shared.readDisableSleep()
+            DispatchQueue.main.async {
+                guard let actual, !hasPowerChanges else { return }
+                disableSleep = actual
+                stealth = false
+                baseDisableSleep = actual
+                baseStealth = false
+                powerError = nil
+            }
+        }
+    }
 
+    private func setPendingDisableSleep(_ enabled: Bool) {
+        disableSleep = enabled
+        if !enabled { stealth = false }
+        powerError = nil
+        hasPendingChanges = true
+    }
+
+    private func setPendingStealth(_ enabled: Bool) {
+        guard disableSleep else { return }
+        stealth = enabled
+        powerError = nil
+        hasPendingChanges = true
+    }
+
+    private func applyChanges() {
+        guard !isApplying else { return }
+        guard defaultMaxWatts != nil || hasPowerChanges else { return }
+
+        isApplying = true
         let targetCap = gpuCap
+        let gpuChanged = hasChanges
+        let targetDisableSleep = disableSleep
+        let targetStealth = stealth
+        let disableChanged = targetDisableSleep != baseDisableSleep
+        let stealthChanged = targetStealth != baseStealth
+
+        if !gpuChanged && !disableChanged && !stealthChanged {
+            hasPendingChanges = false
+            isApplying = false
+            return
+        }
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let status = PowerManager.shared.applyCap(watts: targetCap)
+            let gpuStatus = gpuChanged
+                ? PowerManager.shared.applyCap(watts: targetCap)
+                : nil
+            var powerStatus: PowerManager.PowerPolicyStatus?
+            var powerFailed = false
+
+            if disableChanged {
+                powerStatus = PowerManager.shared.setDisableSleep(targetDisableSleep)
+                powerFailed = powerStatus == nil
+            }
+            if stealthChanged && !powerFailed {
+                powerStatus = PowerManager.shared.setStealth(targetStealth)
+                powerFailed = powerStatus == nil
+            }
 
             DispatchQueue.main.async {
                 isApplying = false
-                if let s = status {
-                    // Update baseline targets on success
-                    baseGpuCap = targetCap
-                    defaultMaxWatts = s.defaultMaxWatts
-                    hasPendingChanges = false
-                } else {
-                    // Roll back working value to previous baseline because execution failed
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        gpuCap = baseGpuCap
+                var failed = powerFailed
+
+                if gpuChanged {
+                    if let gpuStatus {
+                        baseGpuCap = targetCap
+                        defaultMaxWatts = gpuStatus.defaultMaxWatts
+                    } else {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            gpuCap = baseGpuCap
+                        }
+                        failed = true
                     }
-                    hasPendingChanges = false
                 }
+
+                if !powerFailed, let powerStatus {
+                    disableSleep = targetDisableSleep
+                    stealth = targetStealth
+                    baseDisableSleep = targetDisableSleep
+                    baseStealth = targetStealth
+                    powerError = nil
+                } else if powerFailed {
+                    powerError = "Could not apply sleep policy"
+                }
+
+                hasPendingChanges = failed
             }
         }
     }
