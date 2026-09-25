@@ -186,11 +186,10 @@ final class PowerPolicyController {
         defer { lock.unlock() }
         if let actual = readSleepDisabled(), actual != disableSleepEnabled {
             disableSleepEnabled = actual
-            if !actual { stealthEnabled = false }
         }
         return Status(
             disableSleep: disableSleepEnabled,
-            stealth: stealthEnabled && disableSleepEnabled
+            stealth: stealthEnabled
         )
     }
 
@@ -268,7 +267,33 @@ final class PowerPolicyController {
 
         let wasClosed = lastLidClosed ?? false
         lastLidClosed = closed
-        guard !closed, wasClosed, disableSleepEnabled, stealthEnabled else { return }
+        guard stealthEnabled else { return }
+
+        if closed {
+            // Re-arm the policy for every new close event. The previous
+            // open event may have restored normal sleep before sleepnow.
+            guard !wasClosed else { return }
+            if readSleepDisabled() == true {
+                disableSleepEnabled = true
+                return
+            }
+            if let error = runPmset(["-a", "disablesleep", "1"]) {
+                fputs("[helper] stealth failed to disable sleep on lid close: \(error)\n", stderr)
+                return
+            }
+            guard readSleepDisabled() == true else {
+                fputs("[helper] stealth could not verify sleep disabled on lid close\n", stderr)
+                return
+            }
+            disableSleepEnabled = true
+            ownsSleepDisabled = true
+            return
+        }
+
+        // Fire only on a real closed -> open transition. Keep stealthEnabled
+        // true so the next close/open cycle can arm and fire again.
+        guard wasClosed else { return }
+        guard disableSleepEnabled || readSleepDisabled() == true else { return }
 
         if let error = runPmset(["-a", "disablesleep", "0"]) {
             fputs("[helper] stealth failed to re-enable sleep: \(error)\n", stderr)
@@ -280,7 +305,6 @@ final class PowerPolicyController {
         }
 
         disableSleepEnabled = false
-        stealthEnabled = false
         ownsSleepDisabled = false
 
         if let error = runPmset(["sleepnow"]) {
@@ -307,7 +331,7 @@ final class PowerPolicyController {
     private func statusLocked() -> Status {
         Status(
             disableSleep: disableSleepEnabled,
-            stealth: stealthEnabled && disableSleepEnabled
+            stealth: stealthEnabled
         )
     }
 }

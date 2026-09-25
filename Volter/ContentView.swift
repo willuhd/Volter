@@ -17,7 +17,6 @@ struct ContentView: View {
 
     @State private var showingSettings = false
     @State private var isApplying = false // Tracking backend execution state
-    @State private var hasPendingChanges = false // sticky flag: true after first edit until next Apply (even if you revert sliders)
     @State private var disableSleep = false
     @State private var stealth = false
     @State private var baseDisableSleep = false
@@ -35,11 +34,9 @@ struct ContentView: View {
     private var sliderWidth: CGFloat { contentWidth - powerLabelWidth - powerReadoutWidth }
     private var headerControlsWidth: CGFloat { powerLabelWidth + sliderWidth }
 
-    /// Hard "Max" (100W): reaching 28W on the slider snaps to restore.
-    /// Visible track ends at 20W; dragging past it accumulates invisibly to 28W.
-    private var sliderMax: Double { PowerManager.snapToMaxWatts }
-    private var trackMax: Double { 20.0 }
-    private var isAtMax: Bool { gpuCap >= PowerManager.snapToMaxWatts - 0.001 }
+    /// Auto is the zero sentinel; 28W is the highest real cap.
+    private var sliderMax: Double { PowerManager.maximumCapWatts }
+    private var trackMax: Double { PowerManager.maximumCapWatts }
 
     // Diff from last applied config — use for sticky logic
     private var hasChanges: Bool {
@@ -48,6 +45,10 @@ struct ContentView: View {
 
     private var hasPowerChanges: Bool {
         disableSleep != baseDisableSleep || stealth != baseStealth
+    }
+
+    private var hasPendingChanges: Bool {
+        hasChanges || hasPowerChanges
     }
     
     var body: some View {
@@ -138,10 +139,6 @@ struct ContentView: View {
         }
         .frame(width: 290, height: 90, alignment: .topLeading)
         .clipped() // Prevents sliding views from rendering outside the window boundaries
-        .onChange(of: hasChanges) { _, newValue in
-            if newValue { hasPendingChanges = true }
-        }
-        .onChange(of: gpuCap) { _, _ in if hasChanges { hasPendingChanges = true } }
         .task {
             refreshPowerPolicy()
             refreshFromHelper()
@@ -211,7 +208,7 @@ struct ContentView: View {
     private var mainBody: some View {
         Group {
             if defaultMaxWatts != nil {
-                // GPU cap slider (far left = Auto, far right = Max/restore)
+                // GPU cap slider (far left = Auto, far right = 28W cap)
                 HStack(spacing: 0) {
                     Text("Power:")
                         .font(.body)
@@ -220,11 +217,11 @@ struct ContentView: View {
                         .frame(width: powerLabelWidth, height: rowHeight, alignment: .leading)
 
                     CustomTickSlider(value: $gpuCap, range: 0...sliderMax,
-                                     physicalMax: trackMax, tickCount: 25, stepSize: 1.0)
+                                     physicalMax: trackMax, tickCount: 29, stepSize: 1.0)
                         .frame(width: sliderWidth, height: 24)
 
                     // Static Readout Label (mirrors the old fan Auto pattern)
-                    Text(gpuCap <= 0.001 ? "Auto" : (isAtMax ? "Max" : String(format: "%gW", gpuCap)))
+                    Text(gpuCap <= 0.001 ? "Auto" : String(format: "%gW", gpuCap))
                         .font(.system(size: 12))
                         .lineLimit(1)
                         .multilineTextAlignment(.trailing)
@@ -278,14 +275,13 @@ struct ContentView: View {
             guard let s = PowerManager.shared.readStatus() else { return }
             DispatchQueue.main.async {
                 defaultMaxWatts = s.defaultMaxWatts
-                // Live applied cap; Auto (0) when uncapped or capped above our range
-                if s.capWatts >= s.defaultMaxWatts - 0.001 || s.capWatts > PowerManager.snapToMaxWatts {
+                // Values above the user range represent the uncapped/system state.
+                if s.capWatts > PowerManager.maximumCapWatts + 0.001 {
                     gpuCap = 0.0
                 } else {
                     gpuCap = s.capWatts
                 }
                 baseGpuCap = gpuCap
-                if !hasPowerChanges { hasPendingChanges = false }
             }
         }
     }
@@ -308,19 +304,17 @@ struct ContentView: View {
         disableSleep = enabled
         if !enabled { stealth = false }
         powerError = nil
-        hasPendingChanges = true
     }
 
     private func setPendingStealth(_ enabled: Bool) {
         guard disableSleep else { return }
         stealth = enabled
         powerError = nil
-        hasPendingChanges = true
     }
 
     private func applyChanges() {
         guard !isApplying else { return }
-        guard defaultMaxWatts != nil || hasPowerChanges else { return }
+        guard hasPendingChanges else { return }
 
         isApplying = true
         let targetCap = gpuCap
@@ -329,12 +323,6 @@ struct ContentView: View {
         let targetStealth = stealth
         let disableChanged = targetDisableSleep != baseDisableSleep
         let stealthChanged = targetStealth != baseStealth
-
-        if !gpuChanged && !disableChanged && !stealthChanged {
-            hasPendingChanges = false
-            isApplying = false
-            return
-        }
 
         DispatchQueue.global(qos: .userInitiated).async {
             let gpuStatus = gpuChanged
@@ -354,7 +342,6 @@ struct ContentView: View {
 
             DispatchQueue.main.async {
                 isApplying = false
-                var failed = powerFailed
 
                 if gpuChanged {
                     if let gpuStatus {
@@ -364,7 +351,6 @@ struct ContentView: View {
                         withAnimation(.easeInOut(duration: 0.2)) {
                             gpuCap = baseGpuCap
                         }
-                        failed = true
                     }
                 }
 
@@ -377,8 +363,6 @@ struct ContentView: View {
                 } else if powerFailed {
                     powerError = "Could not apply sleep policy"
                 }
-
-                hasPendingChanges = failed
             }
         }
     }

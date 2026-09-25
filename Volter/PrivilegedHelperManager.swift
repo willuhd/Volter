@@ -124,6 +124,11 @@ final class PrivilegedHelperManager {
         return ret == 0
     }
     
+    /// Returns whether the helper is already reachable without starting it.
+    func isHelperRunning() -> Bool {
+        canConnect()
+    }
+
     private func waitForSocket(timeout: TimeInterval) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
