@@ -509,11 +509,6 @@ func cleanupAndExit(_ code: Int32) -> Never {
         _ = restoreDefaultCap()
     }
     unlink(globalSocketPathForCleanup)
-    // Try to remove parent dir if empty and is our volter-xxx dir
-    let dir = (globalSocketPathForCleanup as NSString).deletingLastPathComponent
-    if dir.contains("volter-") {
-        rmdir(dir)
-    }
     exit(code)
 }
 // Signal handling via parent watchdog; socket removed in cleanupAndExit
@@ -521,15 +516,6 @@ func cleanupAndExit(_ code: Int32) -> Never {
 signal(SIGTERM, SIG_IGN)
 signal(SIGINT, SIG_IGN)
 
-// Ensure parent dir exists - 0755 when created as root so user can traverse (token protects)
-let sockDir = (sockPath as NSString).deletingLastPathComponent
-do {
-    try FileManager.default.createDirectory(atPath: sockDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
-    chmod(sockDir, 0o755)
-} catch {
-    fputs("[helper] mkdir sockDir failed \(error)\n", stderr)
-    exit(1)
-}
 // Remove stale socket if present and not in use
 if FileManager.default.fileExists(atPath: sockPath) {
     // Try to connect - if success, another helper is alive

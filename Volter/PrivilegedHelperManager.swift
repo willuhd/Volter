@@ -11,17 +11,14 @@ final class PrivilegedHelperManager {
     static let shared = PrivilegedHelperManager()
     
     private let token: String
-    private let socketDir: String
     private let socketPath: String
     private var tokenGeneratedAt = Date()
     
     private init() {
         self.token = UUID().uuidString
-        // Use per-user temp dir with 0700 - matches helper's expectation
-        // /tmp/volter-<uid>/helper.sock is simple and matches helper's mkdir 0700
+        // Keep the endpoint in /tmp while isolating users in the filename.
         let uid = getuid()
-        self.socketDir = "/tmp/volter-\(uid)"
-        self.socketPath = "\(socketDir)/helper.sock"
+        self.socketPath = "/tmp/volter-\(uid).sock"
     }
     
     // MARK: - Helper binary location
@@ -151,8 +148,6 @@ final class PrivilegedHelperManager {
         }
         // Ensure helper is executable
         try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helper)
-        // Pre-create socket dir as user so root helper's 0755 dir is traversable (fixes 0700 root bug)
-        try? FileManager.default.createDirectory(atPath: socketDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         
         let ppid = getpid()
         // Escape single quotes in paths
