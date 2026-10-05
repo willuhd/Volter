@@ -140,8 +140,16 @@ struct ContentView: View {
         .frame(width: 290, height: 90, alignment: .topLeading)
         .clipped() // Prevents sliding views from rendering outside the window boundaries
         .task {
+            ClamshellMonitor.shared.start()
             refreshPowerPolicy()
             refreshFromHelper()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .volterLidOpened)) { _ in
+            // Stealth: lid opened → lock the screen, keep the system awake
+            // so remote sessions survive. No-op unless stealth is armed.
+            if stealth {
+                ScreenLock.lock()
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWorkspace.didWakeNotification)) { _ in
             refreshPowerPolicy()
@@ -196,7 +204,7 @@ struct ContentView: View {
                 .clipped()
                 .layoutPriority(1)
                 .disabled(isApplying)
-                .help("When enabled, sleep as soon as the lid opens")
+                .help("When enabled, lock the screen as soon as the lid opens")
                 .transition(.opacity.combined(with: .scale))
             }
         }

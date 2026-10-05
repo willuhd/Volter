@@ -176,6 +176,11 @@ final class PowerPolicyController {
     private var ownsSleepDisabled = false
     private var clamshellObserverAvailable = false
     private var lastLidClosed: Bool?
+    /// Held for the whole disable-sleep session. Prevents the idle display
+    /// timer from firing (keeps the compositor/framebuffer alive for UI
+    /// work) and, while held, the system cannot idle-sleep either.
+    /// Auto-released by the OS if the helper dies — no restore needed.
+    private var displayAssertionID: IOPMAssertionID = IOPMAssertionID(kIOPMNullAssertionID)
 
     init() {
         disableSleepEnabled = readSleepDisabled() ?? false
@@ -211,8 +216,13 @@ final class PowerPolicyController {
             }
             disableSleepEnabled = true
             if !wasAlreadyDisabled { ownsSleepDisabled = true }
+            // Keep the display (and therefore the compositor) awake for the
+            // session. Soft-fail: disablesleep alone still protects system
+            // sleep; a missing display assertion is logged, not fatal.
+            ensureDisplayAssertionLocked()
         } else {
             stealthEnabled = false
+            releaseDisplayAssertionLocked()
             if readSleepDisabled() == false {
                 disableSleepEnabled = false
                 ownsSleepDisabled = false
@@ -270,48 +280,22 @@ final class PowerPolicyController {
         guard stealthEnabled else { return }
 
         if closed {
-            // Re-arm the policy for every new close event. The previous
-            // open event may have restored normal sleep before sleepnow.
+            // Steady-state: keep the existing policy armed. The app locks
+            // the screen on the next open event; the helper must NOT toggle
+            // disablesleep here — that cycle destabilizes wake on Apple Silicon.
             guard !wasClosed else { return }
-            if readSleepDisabled() == true {
-                disableSleepEnabled = true
-                return
+            if readSleepDisabled() != true {
+                fputs("[helper] stealth sleep override lost on lid close\n", stderr)
             }
-            if let error = runPmset(["-a", "disablesleep", "1"]) {
-                fputs("[helper] stealth failed to disable sleep on lid close: \(error)\n", stderr)
-                return
-            }
-            guard readSleepDisabled() == true else {
-                fputs("[helper] stealth could not verify sleep disabled on lid close\n", stderr)
-                return
-            }
-            disableSleepEnabled = true
-            ownsSleepDisabled = true
+            ensureDisplayAssertionLocked()
             return
         }
 
-        // Fire only on a real closed -> open transition. Keep stealthEnabled
-        // true so the next close/open cycle can arm and fire again.
+        // Lid opened: the app performs the screen lock (private SAC API with
+        // displaysleepnow fallback). The system stays awake so remote
+        // sessions survive — no disablesleep toggle, no sleepnow.
         guard wasClosed else { return }
-        guard disableSleepEnabled || readSleepDisabled() == true else { return }
-
-        if let error = runPmset(["-a", "disablesleep", "0"]) {
-            fputs("[helper] stealth failed to re-enable sleep: \(error)\n", stderr)
-            return
-        }
-        guard readSleepDisabled() == false else {
-            fputs("[helper] stealth could not verify sleep re-enabled\n", stderr)
-            return
-        }
-
-        disableSleepEnabled = false
-        ownsSleepDisabled = false
-
-        if let error = runPmset(["sleepnow"]) {
-            fputs("[helper] stealth sleepnow failed: \(error)\n", stderr)
-        } else {
-            fputs("[helper] stealth sleep requested after lid opened\n", stderr)
-        }
+        fputs("[helper] stealth lid opened, lock handled app-side\n", stderr)
     }
 
     func cleanup() {
@@ -319,6 +303,7 @@ final class PowerPolicyController {
         defer { lock.unlock() }
 
         stealthEnabled = false
+        releaseDisplayAssertionLocked()
         if ownsSleepDisabled {
             if let error = runPmset(["-a", "disablesleep", "0"]) {
                 fputs("[helper] cleanup failed to re-enable sleep: \(error)\n", stderr)
@@ -326,6 +311,34 @@ final class PowerPolicyController {
         }
         ownsSleepDisabled = false
         disableSleepEnabled = readSleepDisabled() ?? false
+    }
+
+    /// Take the display assertion if not already held. Lock must be held.
+    private func ensureDisplayAssertionLocked() {
+        guard displayAssertionID == IOPMAssertionID(kIOPMNullAssertionID) else { return }
+        var assertionID: IOPMAssertionID = IOPMAssertionID(kIOPMNullAssertionID)
+        let result = IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            "Volter keep display awake for UI testing" as CFString,
+            &assertionID
+        )
+        guard result == kIOReturnSuccess else {
+            fputs("[helper] display assertion failed: 0x\(String(result, radix: 16))\n", stderr)
+            return
+        }
+        displayAssertionID = assertionID
+        fputs("[helper] display assertion held\n", stderr)
+    }
+
+    /// Release the display assertion if held. Lock must be held.
+    private func releaseDisplayAssertionLocked() {
+        guard displayAssertionID != IOPMAssertionID(kIOPMNullAssertionID) else { return }
+        let result = IOPMAssertionRelease(displayAssertionID)
+        if result != kIOReturnSuccess {
+            fputs("[helper] display assertion release failed: 0x\(String(result, radix: 16))\n", stderr)
+        }
+        displayAssertionID = IOPMAssertionID(kIOPMNullAssertionID)
     }
 
     private func statusLocked() -> Status {
