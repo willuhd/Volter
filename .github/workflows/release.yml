@@ -1,0 +1,127 @@
+name: Release DMG
+
+# Manual invocation only. Ordinary commits, pushes and pull requests never
+# trigger this workflow.
+#
+# GitHub only shows the "Run workflow" button once this file exists on the
+# default branch, so it has to be on main before it can be dispatched.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string used in the DMG filename"
+        required: true
+        default: "1.0"
+
+# This job only reads the repository and uploads a build artifact.
+permissions:
+  contents: read
+
+jobs:
+  dmg:
+    name: Build Volter.dmg
+    # macos-26 is the arm64 image and carries Xcode 26 with the macOS 26 SDK.
+    # Standard GitHub-hosted runners are free for public repositories.
+    runs-on: macos-26
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          python3 --version
+
+      - name: Install dmgbuild
+        run: |
+          set -euo pipefail
+          pipx install dmgbuild || pipx upgrade dmgbuild
+          command -v dmgbuild
+
+      - name: Build app bundle
+        run: |
+          set -euo pipefail
+          # The signing overrides are required: the project is set to Automatic
+          # signing with DEVELOPMENT_TEAM 42FUNX75XP, and a runner has no Apple
+          # account to fetch a provisioning profile with. CODE_SIGN_IDENTITY="-"
+          # is an ad-hoc signature -- no certificate involved, so there is
+          # nothing that can expire or be revoked.
+          #
+          # The Volter scheme builds the app target, which in turn builds
+          # VolterHelper and copies it into Contents/Resources.
+          #
+          # ARCHS is deliberately universal so the one DMG serves both Intel and
+          # Apple Silicon. Drop to ARCHS="arm64" for an Apple-Silicon-only,
+          # roughly half-length build.
+          xcodebuild \
+            -project Volter.xcodeproj \
+            -scheme Volter \
+            -configuration Release \
+            -derivedDataPath build \
+            ARCHS="arm64 x86_64" \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGNING_REQUIRED=YES \
+            DEVELOPMENT_TEAM= \
+            MARKETING_VERSION="${{ inputs.version }}" \
+            build
+
+      - name: Ad-hoc sign the app bundle and its helper
+        run: |
+          set -euo pipefail
+          APP="$(find build -maxdepth 4 -name Volter.app -type d -print -quit)"
+          if [ -z "$APP" ]; then
+            echo "::error::Volter.app was not produced by the build"
+            exit 1
+          fi
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          echo "app bundle: $APP"
+
+          # The helper lives in Contents/Resources, which is a non-standard code
+          # location: codesign --deep does not reliably traverse it. So sign the
+          # helper explicitly first, then the app -- that order means the app's
+          # resource seal covers the helper's final bytes.
+          HELPER="$APP/Contents/Resources/VolterHelper"
+          if [ ! -f "$HELPER" ]; then
+            echo "::error::VolterHelper missing from Contents/Resources"
+            exit 1
+          fi
+
+          # Xcode's linker-level ad-hoc signature is enough for the kernel to
+          # execute a binary, but it does not seal the bundle's resources.
+          # Gatekeeper treats an unsealed bundle as tampered with and reports
+          # "is damaged and can't be opened", which on Apple Silicon has no
+          # approval path at all.
+          codesign --force --options runtime --timestamp=none --sign - "$HELPER"
+          codesign --force --options runtime --timestamp=none --sign - "$APP"
+          codesign --verify --strict --verbose=2 "$HELPER"
+          codesign --verify --strict --verbose=2 "$APP"
+
+          echo "--- helper signature ---"
+          codesign -dvvv "$HELPER" 2>&1 \
+            | grep -E "Authority|Signature|TeamIdentifier|flags=" || true
+          echo "--- app signature ---"
+          codesign -dvvv "$APP" 2>&1 \
+            | grep -E "Authority|Signature|TeamIdentifier|flags=|Format" || true
+
+      - name: Build DMG
+        run: |
+          set -euo pipefail
+          .github/release/make-dmg.sh "$APP" "Volter-${{ inputs.version }}.dmg"
+
+          echo "--- image ---"
+          hdiutil imageinfo "Volter-${{ inputs.version }}.dmg" \
+            | grep -E "Format Description|Class Name|Total Bytes" || true
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v7
+        with:
+          path: Volter-*.dmg
+          # Upload without wrapping it in a zip so the artifact downloads as a
+          # plain .dmg. With archive: false only one file may be uploaded, and
+          # the artifact takes the file's name -- `name` is ignored.
+          archive: false
+          if-no-files-found: error
